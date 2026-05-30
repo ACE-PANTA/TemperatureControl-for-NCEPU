@@ -1,0 +1,67 @@
+:root {
+  --ev-c-white: #ffffff;
+  --ev-c-white-soft: #f8f8f8;
+  --ev-c-white-mute: #f2f2f2;
+
+  --ev-c-black: #1b1b1f;
+  --ev-c-black-soft: #222222;
+  --ev-c-black-mute: #282828;
+
+  --ev-c-gray-1: #515c67;
+  --ev-c-gray-2: #414853;
+  --ev-c-gray-3: #32363f;
+
+  --ev-c-text-1: rgba(255, 255, 245, 0.86);
+  --ev-c-text-2: rgba(235, 235, 245, 0.6);
+  --ev-c-text-3: rgba(235, 235, 245, 0.38);
+
+  --color-back-content: rgb(252, 252, 252);
+  --color-back-border: rgb(183, 183, 183);
+  --color-title:rgb(109, 75, 232);
+  --color-desc: #2c2c2c;
+  --color-blue-soft: rgb(20, 126, 232);
+  --color-blue-soft-hover: rgb(66, 149, 232);
+
+  --color-green-deep:rgb(52, 173, 80);
+  --color-blue-gray:rgb(20, 155, 212);
+  --color-blue-gray-hover:rgb(54, 181, 235);
+
+  --color-tabs:rgb(50, 95, 244);
+  --color-tabs-active:rgb(243, 166, 58);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  font-weight: normal;
+}
+
+ul {
+  list-style: none;
+}
+
+body {
+  min-height: 100vh;
+  height: 100%;
+  color: var(--color-text);
+  background: var(--color-background);
+  line-height: 1.6;
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    'Fira Sans',
+    'Droid Sans',
+    'Helvetica Neue',
+    sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

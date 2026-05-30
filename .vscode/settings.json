@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^npx eslint src/renderer/src/views/Home\\.vue$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

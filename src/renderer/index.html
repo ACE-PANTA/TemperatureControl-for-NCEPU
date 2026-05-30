@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>温控系统</title>
+    <meta http-equiv="Content-Security-Policy" 
+    content="default-src 'self' 'unsafe-inline' ws://* stun://*;
+            connect-src 'self' http://140.143.145.193:8765 ws://140.143.145.193:8765 http://localhost:5124 ws://localhost:5124 https://api.deepseek.com;
+            script-src 'self' 'unsafe-inline' 'unsafe-eval';
+            img-src * blob: data:;
+            media-src * blob: * data:*;">
+  </head>
+
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

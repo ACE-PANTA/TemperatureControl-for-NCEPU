@@ -3,6 +3,10 @@
         "/^npx eslint src/renderer/src/views/Home\\.vue$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^\\$samples = @\\(@\\('!MODE=AUTO\\*10','MODE=AUTO'\\), @\\('!MODE=MAN\\*5D','MODE=MAN'\\), @\\('!PWM=35\\*50','PWM=35'\\), @\\('!PWM=-40\\*7F','PWM=-40'\\), @\\('!TEMP=30\\.5\\*08','TEMP=30\\.5'\\), @\\('!PID=1\\.200,0\\.050,0\\.010\\*68','PID=1\\.200,0\\.050,0\\.010'\\), @\\('!GET=STATE\\*1D','GET=STATE'\\), @\\('!GET=PID\\*17','GET=PID'\\)\\); foreach \\(\\$pair in \\$samples\\) \\{ \\$full = \\$pair\\[0\\]; \\$body = \\$pair\\[1\\]; \\$fullNoCs = \\$full\\.Substring\\(0, \\$full\\.LastIndexOf\\('\\*'\\) \\+ 1\\); \\$variants = \\[ordered\\]@\\{\\}; foreach \\(\\$entry in @\\(@\\('bodyXor',\\$body\\), @\\('bangBodyXor','!' \\+ \\$body\\), @\\('bodyStarXor',\\$body \\+ '\\*'\\), @\\('fullNoCsXor',\\$fullNoCs\\)\\)\\) \\{ \\$acc = 0; foreach \\(\\$ch in \\$entry\\[1\\]\\.ToCharArray\\(\\)\\) \\{ \\$acc = \\$acc -bxor \\[int\\]\\[char\\]\\$ch \\}; \\$variants\\[\\$entry\\[0\\]\\] = \\('\\{0:X2\\}' -f \\$acc\\) \\}; foreach \\(\\$entry in @\\(@\\('bodySum',\\$body\\), @\\('bangBodySum','!' \\+ \\$body\\), @\\('fullNoCsSum',\\$fullNoCs\\)\\)\\) \\{ \\$acc = 0; foreach \\(\\$ch in \\$entry\\[1\\]\\.ToCharArray\\(\\)\\) \\{ \\$acc = \\(\\$acc \\+ \\[int\\]\\[char\\]\\$ch\\) -band 0xFF \\}; \\$variants\\[\\$entry\\[0\\]\\] = \\('\\{0:X2\\}' -f \\$acc\\) \\}; Write-Output \"\\$full \\$\\(\\(\\$variants\\.GetEnumerator\\(\\) \\| ForEach-Object \\{ \\$_\\.Key \\+ '=' \\+ \\$_\\.Value \\}\\) -join ' '\\)\" \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

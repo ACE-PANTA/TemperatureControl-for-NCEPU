@@ -1,10 +1,6 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import {
-  advanceSimulation,
-  applyPidSettings,
-  applyPlantSettings,
-  createSimulationChannel,
   defaultPidDraft,
   normalizePidPayload
 } from '../services/pidSimulation.js';
@@ -12,21 +8,85 @@ import { useDeviceRuntimeStore } from './deviceRuntime.js';
 import { useSystemConfigStore } from './systemConfig.js';
 
 const deviceApi = window.deviceApi;
-const SAMPLE_PERIOD_MS = 1000;
 
-function buildSeedCurve(size = 24) {
-  const base = [432, 438, 446, 459, 472, 488, 507, 524, 541, 559, 576, 590, 603, 617, 632, 645, 658, 669, 676, 682, 688, 694, 699, 704];
+const SERIES_STYLE_MAP = {
+  furnaceTemp: { label: '炉膛温度', shortLabel: '炉膛', unit: '°C', color: '#31ddff' },
+  pwm: { label: 'PWM', shortLabel: 'PWM', unit: '%', color: '#ffb347' },
+  boardTemp: { label: '板载温度', shortLabel: '板载', unit: '°C', color: '#7ef7c9' }
+};
 
-  if (size <= base.length) {
-    return base.slice(-size);
+const FALLBACK_SERIES_COLORS = ['#ff8a65', '#c3f73a', '#ffd166', '#b388ff', '#6ee7ff', '#f78fb3', '#95f9e3'];
+const MAX_CURVE_HISTORY_POINTS = 18000;
+
+function toNumeric(value, fallback = 0) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function getSeriesStyle(key, index = 0) {
+  if (key && SERIES_STYLE_MAP[key]) {
+    return SERIES_STYLE_MAP[key];
   }
 
-  const curve = [...base];
-  while (curve.length < size) {
-    curve.unshift(curve[0]);
-  }
+  const fallbackLabel = `通道${index + 1}`;
+  return {
+    label: fallbackLabel,
+    shortLabel: fallbackLabel,
+    unit: '',
+    color: FALLBACK_SERIES_COLORS[index % FALLBACK_SERIES_COLORS.length]
+  };
+}
 
-  return curve;
+function createSeriesEntry({ key, index = 0, value, label, shortLabel, unit, color }) {
+  const style = getSeriesStyle(key, index);
+  return {
+    key: key || `channel${index + 1}`,
+    label: label || style.label,
+    shortLabel: shortLabel || style.shortLabel,
+    unit: unit ?? style.unit,
+    color: color || style.color,
+    value: Number(toNumeric(value).toFixed(2))
+  };
+}
+
+function createCurveSample({ elapsedSeconds, timestamp, channel, temperature, requestedSetpoint, series }) {
+  return {
+    elapsedSeconds: Number(elapsedSeconds),
+    timestamp: Number(timestamp || Date.now()),
+    channel,
+    temperature: Number(toNumeric(temperature).toFixed(2)),
+    requestedSetpoint: Number(toNumeric(requestedSetpoint).toFixed(2)),
+    series
+  };
+}
+
+function createCurveSampleFromSerial(payload, elapsedSeconds, requestedSetpoint) {
+  const telemetry = Array.isArray(payload.telemetry) ? payload.telemetry : [];
+  const series = telemetry.length
+    ? telemetry.map((entry, index) => createSeriesEntry({
+      key: entry.key || `channel${entry.channel || index + 1}`,
+      index,
+      value: entry.value,
+      label: entry.label,
+      shortLabel: entry.label,
+      unit: entry.unit
+    }))
+    : [
+      createSeriesEntry({ key: 'furnaceTemp', value: payload.furnaceTemp }),
+      createSeriesEntry({ key: 'pwm', value: payload.pwm }),
+      createSeriesEntry({ key: 'boardTemp', value: payload.boardTemp })
+    ].filter((entry) => Number.isFinite(entry.value));
+
+  const furnaceSeries = series.find((entry) => entry.key === 'furnaceTemp') || series[0] || createSeriesEntry({ key: 'furnaceTemp', value: 0 });
+
+  return createCurveSample({
+    elapsedSeconds,
+    timestamp: payload.timestamp,
+    channel: 'serial',
+    temperature: furnaceSeries.value,
+    requestedSetpoint,
+    series
+  });
 }
 
 function createRecordingSessionId() {
@@ -43,15 +103,33 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     serial: null,
     ethernet: null
   });
-  const curveHistory = ref(buildSeedCurve().map((temperature, index) => ({
-    elapsedSeconds: index + 1,
-    temperature
-  })));
+  const curveHistory = ref([]);
   const chartPanOffset = ref(0);
   const latestPidDispatch = ref(null);
   const lastAppliedPid = ref({ ...defaultPidDraft });
   const previousAppliedPid = ref(null);
+  const requestedSetpoint = ref(null);
   const runtimeStarted = ref(false);
+  const serialStreamState = reactive({
+    active: false,
+    baselineTimestamp: 0,
+    sampleIndex: 0,
+    unsubscribe: null
+  });
+  const serialProtocolState = reactive({
+    unsubscribe: null,
+    lastAck: null,
+    lastError: '',
+    lastMessageAt: null,
+    busy: false
+  });
+  const controllerState = reactive({
+    mode: null,
+    pwm: null,
+    goal: null,
+    feedback: null,
+    updatedAt: null
+  });
   const batchBuffers = reactive({
     serial: [],
     ethernet: []
@@ -68,19 +146,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     sessionId: '',
     sessionStartedAt: null
   });
-
-  const channels = {
-    serial: createSimulationChannel('serial', {
-      pidOverrides: configStore.pidDraft,
-      plantOverrides: configStore.plantDraft
-    }),
-    ethernet: createSimulationChannel('ethernet', {
-      pidOverrides: configStore.pidDraft,
-      plantOverrides: configStore.plantDraft
-    })
-  };
-
-  let timer = null;
 
   const pidDraft = computed(() => configStore.pidDraft);
   const plantDraft = computed(() => configStore.plantDraft);
@@ -128,11 +193,23 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     return primary ? currentSamples[primary] || null : null;
   });
 
-  const currentTemp = computed(() => primarySample.value?.temperature ?? curvePoints.value.at(-1) ?? 0);
-  const targetTemp = computed(() => primarySample.value?.requestedSetpoint ?? channels.serial.state.requestedSetpoint);
+  const currentTemp = computed(() => primarySample.value?.temperature ?? controllerState.feedback);
+  const targetTemp = computed(() => primarySample.value?.requestedSetpoint ?? requestedSetpoint.value ?? controllerState.goal);
   const furnaceState = computed(() => {
     if (!deviceStore.primaryChannel) {
       return '待连接';
+    }
+
+    if (!primarySample.value) {
+      if (controllerState.mode === 'MAN') {
+        return '手动输出';
+      }
+
+      return controllerState.mode === 'AUTO' ? '自动待采样' : '无数据';
+    }
+
+    if (controllerState.mode === 'MAN') {
+      return '手动输出';
     }
 
     if ((primarySample.value?.controlOutput || 0) > 52) {
@@ -151,7 +228,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return {
         overshootPercent: 0,
         settlingTime: '--',
-        controlOutput: 0,
+        controlOutput: Number(toNumeric(controllerState.pwm, 0).toFixed(1)),
         disturbance: 0
       };
     }
@@ -183,10 +260,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   function resizeCurve() {
     const history = curveHistory.value;
     if (!history.length) {
-      curveHistory.value = buildSeedCurve(visiblePointCount.value).map((temperature, index) => ({
-        elapsedSeconds: index + 1,
-        temperature
-      }));
+      chartPanOffset.value = 0;
       return;
     }
 
@@ -194,11 +268,12 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     chartPanOffset.value = Math.min(chartPanOffset.value, maxOffset);
   }
 
-  function appendCurvePoint(elapsedSeconds, value) {
-    curveHistory.value = [...curveHistory.value, {
-      elapsedSeconds: Number(elapsedSeconds),
-      temperature: Number(value.toFixed(1))
-    }];
+  function appendCurveSample(sample) {
+    curveHistory.value.push(sample);
+
+    if (curveHistory.value.length > MAX_CURVE_HISTORY_POINTS) {
+      curveHistory.value.splice(0, curveHistory.value.length - MAX_CURVE_HISTORY_POINTS);
+    }
   }
 
   function panChartWindow(deltaPoints) {
@@ -210,14 +285,328 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     chartPanOffset.value = 0;
   }
 
-  function syncPlantDraft() {
-    applyPlantSettings(channels.serial, configStore.plantDraft);
-    applyPlantSettings(channels.ethernet, configStore.plantDraft);
+  function applyControllerState(snapshot) {
+    controllerState.mode = snapshot.mode || controllerState.mode;
+    controllerState.pwm = Number.isFinite(snapshot.pwm) ? snapshot.pwm : controllerState.pwm;
+    controllerState.goal = Number.isFinite(snapshot.goal) ? snapshot.goal : controllerState.goal;
+    controllerState.feedback = Number.isFinite(snapshot.feedback) ? snapshot.feedback : controllerState.feedback;
+    controllerState.updatedAt = Date.now();
+
+    if (Number.isFinite(snapshot.goal)) {
+      requestedSetpoint.value = snapshot.goal;
+    }
+
+    if (currentSamples.serial) {
+      currentSamples.serial = {
+        ...currentSamples.serial,
+        requestedSetpoint: Number.isFinite(snapshot.goal) ? snapshot.goal : currentSamples.serial.requestedSetpoint,
+        controlOutput: Number.isFinite(snapshot.pwm) ? snapshot.pwm : currentSamples.serial.controlOutput,
+        temperature: Number.isFinite(snapshot.feedback) ? snapshot.feedback : currentSamples.serial.temperature,
+        mode: snapshot.mode || currentSamples.serial.mode
+      };
+    }
   }
 
-  function syncCommittedPidToChannels() {
-    applyPidSettings(channels.serial, lastAppliedPid.value);
-    applyPidSettings(channels.ethernet, lastAppliedPid.value);
+  function applyQueriedPid(snapshot) {
+    if (!Number.isFinite(snapshot.kp) || !Number.isFinite(snapshot.ki) || !Number.isFinite(snapshot.kd)) {
+      return;
+    }
+
+    const normalizedPid = normalizePidPayload({
+      ...configStore.pidDraft,
+      kp: snapshot.kp,
+      ki: snapshot.ki,
+      kd: snapshot.kd
+    });
+
+    Object.assign(configStore.pidDraft, normalizedPid);
+    lastAppliedPid.value = { ...normalizedPid };
+  }
+
+  function handleSerialProtocolMessage(payload) {
+    if (!payload) {
+      return;
+    }
+
+    serialProtocolState.lastMessageAt = payload.timestamp || Date.now();
+
+    if (payload.kind === 'ack') {
+      serialProtocolState.lastAck = payload.status;
+      if (payload.status === 'ERR') {
+        serialProtocolState.lastError = '设备返回 ACK=ERR';
+      }
+      return;
+    }
+
+    if (payload.kind === 'state') {
+      applyControllerState(payload);
+      return;
+    }
+
+    if (payload.kind === 'pid') {
+      applyQueriedPid(payload);
+    }
+  }
+
+  function attachSerialProtocolListener() {
+    if (!deviceApi?.onSerialProtocol || serialProtocolState.unsubscribe) {
+      return;
+    }
+
+    serialProtocolState.unsubscribe = deviceApi.onSerialProtocol((payload) => {
+      handleSerialProtocolMessage(payload);
+    });
+  }
+
+  function detachSerialProtocolListener() {
+    serialProtocolState.unsubscribe?.();
+    serialProtocolState.unsubscribe = null;
+  }
+
+  function ensureSerialControlAvailable(actionText) {
+    if (!deviceApi?.sendSerialCommand) {
+      throw new Error('当前环境未提供真实串口控制能力');
+    }
+
+    if (!deviceStore.serialConnected) {
+      throw new Error(`请先连接串口，再执行${actionText}`);
+    }
+  }
+
+  async function sendSerialProtocolCommand(body, expectKind = 'ack', actionText = '串口控制') {
+    ensureSerialControlAvailable(actionText);
+    serialProtocolState.busy = true;
+    serialProtocolState.lastError = '';
+
+    try {
+      const result = await deviceApi.sendSerialCommand({
+        body,
+        expectKind,
+        timeoutMs: expectKind === 'ack' ? 1600 : 1800
+      });
+
+      if (result?.response) {
+        handleSerialProtocolMessage(result.response);
+      }
+
+      deviceStore.appendEvent(`已发送串口指令：${body}`);
+      return result?.response || null;
+    } catch (error) {
+      serialProtocolState.lastError = error.message || '未知错误';
+      throw error;
+    } finally {
+      serialProtocolState.busy = false;
+    }
+  }
+
+  async function refreshControllerState({ silent = false } = {}) {
+    try {
+      const response = await sendSerialProtocolCommand('GET=STATE', 'state', '状态查询');
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: '状态已同步',
+          message: '已读取控制器当前模式、PWM、目标温度和反馈温度。'
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '状态查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`状态查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshPidParameters({ silent = false } = {}) {
+    try {
+      const response = await sendSerialProtocolCommand('GET=PID', 'pid', 'PID 查询');
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: 'PID 已同步',
+          message: '已读取设备内当前 PID 参数。'
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: 'PID 查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`PID 查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshControllerSnapshot({ silent = false } = {}) {
+    await refreshControllerState({ silent });
+    await refreshPidParameters({ silent });
+  }
+
+  async function setControllerMode(mode) {
+    const normalizedMode = String(mode || '').toUpperCase();
+    if (!['AUTO', 'MAN'].includes(normalizedMode)) {
+      return false;
+    }
+
+    try {
+      await sendSerialProtocolCommand(`MODE=${normalizedMode}`, 'ack', '模式切换');
+      await refreshControllerState({ silent: true });
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '模式切换成功',
+        message: `控制器已切换到${normalizedMode === 'AUTO' ? '自动' : '手动'}模式。`
+      });
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '模式切换失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`模式切换失败：${error.message}`);
+      return false;
+    }
+  }
+
+  async function applyManualPwm(value) {
+    const normalizedPwm = Math.max(-100, Math.min(100, Math.round(Number(value))));
+    if (!Number.isFinite(normalizedPwm)) {
+      deviceStore.pushAlert({ tone: 'warning', title: 'PWM 未下发', message: '请输入有效的 PWM 数值。' });
+      return false;
+    }
+
+    try {
+      await sendSerialProtocolCommand(`PWM=${normalizedPwm}`, 'ack', 'PWM 下发');
+      await refreshControllerState({ silent: true });
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: 'PWM 已下发',
+        message: `手动输出已更新为 ${normalizedPwm}%。`
+      });
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: 'PWM 下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`PWM 下发失败：${error.message}`);
+      return false;
+    }
+  }
+
+  async function openRecordingDirectory() {
+    const directory = await ensureLogDirectory();
+    if (!directory) {
+      deviceStore.pushAlert({
+        tone: 'warning',
+        title: '无法打开目录',
+        message: '当前没有可用的录制目录。'
+      });
+      return false;
+    }
+
+    if (!deviceApi?.openPathInShell) {
+      deviceStore.pushAlert({
+        tone: 'warning',
+        title: '无法打开目录',
+        message: '当前环境未提供打开文件夹能力。'
+      });
+      return false;
+    }
+
+    try {
+      await deviceApi.openPathInShell(directory);
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({
+        tone: 'danger',
+        title: '打开目录失败',
+        message: error.message || '未能打开录制目录。'
+      });
+      return false;
+    }
+  }
+
+  function queueRecordedSample(channel, sample) {
+    if (configStore.settings.csvEnabled && recordingState.active && !recordingState.paused) {
+      batchBuffers[channel].push(sample);
+    }
+
+    if (batchBuffers[channel].length >= 5) {
+      flushChannelBatch(channel);
+    }
+  }
+
+  function ingestSerialFrame(payload) {
+    if (!deviceStore.serialConnected || !payload) {
+      return;
+    }
+
+    const timestamp = toNumeric(payload.timestamp, Date.now());
+
+    if (!serialStreamState.active) {
+      serialStreamState.active = true;
+      serialStreamState.baselineTimestamp = timestamp;
+      serialStreamState.sampleIndex = 0;
+
+      if (deviceStore.primaryChannel === 'serial') {
+        curveHistory.value = [];
+        chartPanOffset.value = 0;
+      }
+
+      deviceStore.appendEvent('已接收 STM32 串口实时遥测');
+    }
+
+    serialStreamState.sampleIndex += 1;
+    const elapsedSeconds = Math.max(
+      serialStreamState.sampleIndex,
+      Math.round((timestamp - serialStreamState.baselineTimestamp) / 1000)
+    );
+    const normalizedSetpoint = currentSamples.serial?.requestedSetpoint ?? controllerState.goal ?? requestedSetpoint.value ?? 0;
+    const sample = {
+      channel: 'serial',
+      timestamp,
+      elapsedSeconds,
+      sampleIndex: serialStreamState.sampleIndex,
+      temperature: Number(toNumeric(payload.furnaceTemp, currentSamples.serial?.temperature ?? 0).toFixed(2)),
+      setpoint: normalizedSetpoint,
+      requestedSetpoint: normalizedSetpoint,
+      controlOutput: Number(toNumeric(payload.pwm, currentSamples.serial?.controlOutput ?? 0).toFixed(2)),
+      disturbance: Number(toNumeric(currentSamples.serial?.disturbance, 0).toFixed(3)),
+      overshootPercent: Number(toNumeric(currentSamples.serial?.overshootPercent, 0).toFixed(2)),
+      settlingTime: currentSamples.serial?.settlingTime ?? null,
+      mode: controllerState.mode || 'serial-live',
+      kp: Number(lastAppliedPid.value.kp),
+      ki: Number(lastAppliedPid.value.ki),
+      kd: Number(lastAppliedPid.value.kd),
+      sampleTime: 1,
+      outputLimit: 100,
+      deadband: 0,
+      setpointRamp: 0,
+      xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
+      boardTemperature: Number(toNumeric(payload.boardTemp, 0).toFixed(2)),
+      telemetry: Array.isArray(payload.telemetry) ? payload.telemetry : []
+    };
+
+    currentSamples.serial = sample;
+    requestedSetpoint.value = sample.requestedSetpoint;
+    controllerState.feedback = sample.temperature;
+    controllerState.pwm = sample.controlOutput;
+    queueRecordedSample('serial', sample);
+
+    if (deviceStore.primaryChannel === 'serial') {
+      appendCurveSample(createCurveSampleFromSerial(payload, elapsedSeconds, normalizedSetpoint));
+    }
+  }
+
+  function attachSerialFrameListener() {
+    if (!deviceApi || serialStreamState.unsubscribe) {
+      return;
+    }
+
+    serialStreamState.unsubscribe = deviceApi.onSerialFrame((payload) => {
+      ingestSerialFrame(payload);
+    });
+  }
+
+  function detachSerialFrameListener() {
+    serialStreamState.unsubscribe?.();
+    serialStreamState.unsubscribe = null;
   }
 
   function hasActiveConnection() {
@@ -358,6 +747,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return;
     }
 
+    const finishedSessionId = recordingState.sessionId;
+    const directory = await ensureLogDirectory();
     await Promise.all([flushChannelBatch('serial'), flushChannelBatch('ethernet')]);
     recordingState.active = false;
     recordingState.paused = false;
@@ -366,6 +757,19 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     recordingState.sessionId = '';
     recordingState.sessionStartedAt = null;
     deviceStore.appendEvent(recordingState.lastAction);
+
+    if (reason !== 'disconnect') {
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '录制完成',
+        message: finishedSessionId
+          ? `会话 ${finishedSessionId} 已结束，录制文件已写入保存目录。`
+          : '录制已结束，录制文件已写入保存目录。',
+        ttl: 0,
+        actionLabel: directory ? '打开文件夹' : '',
+        action: directory ? () => openRecordingDirectory() : null
+      });
+    }
   }
 
   async function reconcileRecordingLifecycle() {
@@ -388,49 +792,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  function tickChannel(channel) {
-    const connected = channel === 'serial' ? deviceStore.serialConnected : deviceStore.ethernetConnected;
-    if (!connected) {
-      return null;
-    }
-
-    const sample = advanceSimulation(channels[channel], 1);
-    sampleCounters[channel] += 1;
-    sample.sampleIndex = sampleCounters[channel];
-    sample.xAxisSecondsPerDivision = Number(configStore.settings.xAxisSecondsPerDivision);
-    currentSamples[channel] = sample;
-
-    if (configStore.settings.csvEnabled && recordingState.active && !recordingState.paused) {
-      batchBuffers[channel].push(sample);
-    }
-
-    if (batchBuffers[channel].length >= 5) {
-      flushChannelBatch(channel);
-    }
-
-    return sample;
-  }
-
-  async function tick() {
-    await reconcileRecordingLifecycle();
-    if (!hasActiveConnection()) {
-      return;
-    }
-
-    tickChannel('serial');
-    tickChannel('ethernet');
-
-    const displaySample = deviceStore.primaryChannel
-      ? currentSamples[deviceStore.primaryChannel]
-      : deviceStore.serialConnected
-        ? currentSamples.serial
-        : currentSamples.ethernet;
-
-    if (displaySample) {
-      appendCurvePoint(displaySample.elapsedSeconds, displaySample.temperature);
-    }
-  }
-
   async function ensureRunning() {
     if (runtimeStarted.value) {
       return;
@@ -438,21 +799,19 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
     runtimeStarted.value = true;
     resizeCurve();
-    syncPlantDraft();
-    syncCommittedPidToChannels();
+    attachSerialFrameListener();
+    attachSerialProtocolListener();
     await ensureLogDirectory();
-    timer = window.setInterval(() => {
-      tick();
-    }, SAMPLE_PERIOD_MS);
+    await reconcileRecordingLifecycle();
+    if (deviceStore.serialConnected) {
+      await refreshControllerSnapshot({ silent: true });
+    }
   }
 
   async function stopRuntime() {
-    if (timer) {
-      window.clearInterval(timer);
-      timer = null;
-    }
-
     runtimeStarted.value = false;
+    detachSerialFrameListener();
+    detachSerialProtocolListener();
     await Promise.all([flushChannelBatch('serial'), flushChannelBatch('ethernet')]);
   }
 
@@ -467,15 +826,14 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   }
 
   function syncDraftToChannels() {
-    syncCommittedPidToChannels();
+    lastAppliedPid.value = normalizePidPayload(configStore.pidDraft);
   }
 
   function applyPlantDraft() {
-    syncPlantDraft();
     deviceStore.pushAlert({
       tone: 'success',
-      title: '仿真对象已更新',
-      message: '新的被控对象参数已经作用到当前仿真模型。'
+      title: '工艺参数已保存',
+      message: '被控对象参数已更新，后续联调时将按这组参数使用。'
     });
     deviceStore.appendEvent('被控对象参数已更新');
   }
@@ -491,9 +849,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
 
     const clampedTarget = Math.min(1200, Math.max(0, normalizedTarget));
-
-    channels.serial.state.requestedSetpoint = clampedTarget;
-    channels.ethernet.state.requestedSetpoint = clampedTarget;
+    requestedSetpoint.value = clampedTarget;
 
     if (currentSamples.serial) {
       currentSamples.serial = {
@@ -510,41 +866,70 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function dispatchPidParameters() {
-    const primary = deviceStore.primaryChannel;
-    if (!primary) {
-      deviceStore.pushAlert({
-        tone: 'warning',
-        title: '参数未下发',
-        message: '请先建立串口或网口主通道，再执行 PID 参数下发。',
-        ttl: 4200
-      });
-      deviceStore.appendEvent('PID 参数下发失败：当前没有活动主通道');
-      return { applied: false };
+  async function commitTargetTemperature(value = requestedSetpoint.value) {
+    if (value === '' || value === null || value === undefined) {
+      deviceStore.pushAlert({ tone: 'warning', title: '目标温度未下发', message: '请输入有效的目标温度。' });
+      return false;
     }
 
+    const normalizedTarget = Number(value);
+    if (!Number.isFinite(normalizedTarget)) {
+      deviceStore.pushAlert({ tone: 'warning', title: '目标温度未下发', message: '请输入有效的目标温度。' });
+      return false;
+    }
+
+    const clampedTarget = Math.min(1200, Math.max(0, normalizedTarget));
+    requestedSetpoint.value = clampedTarget;
+
+    try {
+      await sendSerialProtocolCommand(`TEMP=${clampedTarget.toFixed(1)}`, 'ack', '目标温度下发');
+      await refreshControllerState({ silent: true });
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '目标温度已下发',
+        message: `自动模式目标温度已更新为 ${clampedTarget.toFixed(1)} °C。`
+      });
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '目标温度下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`目标温度下发失败：${error.message}`);
+      return false;
+    }
+  }
+
+  async function dispatchPidParameters() {
     const normalizedPid = normalizePidPayload(configStore.pidDraft);
     Object.assign(configStore.pidDraft, normalizedPid);
-    previousAppliedPid.value = { ...lastAppliedPid.value };
-    lastAppliedPid.value = { ...normalizedPid };
 
-    applyPidSettings(channels.serial, normalizedPid);
-    applyPidSettings(channels.ethernet, normalizedPid);
+    try {
+      await sendSerialProtocolCommand(
+        `PID=${normalizedPid.kp.toFixed(3)},${normalizedPid.ki.toFixed(3)},${normalizedPid.kd.toFixed(3)}`,
+        'ack',
+        'PID 参数下发'
+      );
 
-    latestPidDispatch.value = {
-      channel: primary,
-      timestamp: Date.now(),
-      payload: { ...normalizedPid }
-    };
-    deviceStore.appendEvent(
-      `PID 参数已下发至${primary === 'serial' ? '串口' : '网口'}主通道：Kp ${normalizedPid.kp.toFixed(2)} / Ki ${normalizedPid.ki.toFixed(2)} / Kd ${normalizedPid.kd.toFixed(2)}`
-    );
-    deviceStore.pushAlert({
-      tone: 'success',
-      title: 'PID 参数更新成功',
-      message: `已更新${primary === 'serial' ? '串口' : '网口'}主通道参数。`
-    });
-    return { applied: true, channel: primary };
+      previousAppliedPid.value = { ...lastAppliedPid.value };
+      lastAppliedPid.value = { ...normalizedPid };
+      latestPidDispatch.value = {
+        channel: 'serial',
+        timestamp: Date.now(),
+        payload: { ...normalizedPid }
+      };
+      await refreshPidParameters({ silent: true });
+      deviceStore.appendEvent(
+        `PID 参数已下发到串口控制器：Kp ${normalizedPid.kp.toFixed(3)} / Ki ${normalizedPid.ki.toFixed(3)} / Kd ${normalizedPid.kd.toFixed(3)}`
+      );
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: 'PID 参数更新成功',
+        message: '已更新串口控制器 PID 参数。'
+      });
+      return { applied: true, channel: 'serial' };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: 'PID 参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`PID 参数下发失败：${error.message}`);
+      return { applied: false };
+    }
   }
 
   watch(
@@ -554,8 +939,69 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   );
 
   watch(
-    () => JSON.stringify(configStore.plantDraft),
-    () => syncPlantDraft()
+    () => deviceStore.serialConnected,
+    async (connected) => {
+      if (connected) {
+        attachSerialProtocolListener();
+        await refreshControllerSnapshot({ silent: true });
+        return;
+      }
+
+      serialStreamState.active = false;
+      serialStreamState.baselineTimestamp = 0;
+      serialStreamState.sampleIndex = 0;
+      currentSamples.serial = null;
+      controllerState.mode = null;
+      controllerState.pwm = null;
+      controllerState.goal = null;
+      controllerState.feedback = null;
+      controllerState.updatedAt = null;
+
+      if (deviceStore.primaryChannel !== 'ethernet') {
+        curveHistory.value = [];
+        chartPanOffset.value = 0;
+      }
+    }
+  );
+
+  watch(
+    () => deviceStore.ethernetConnected,
+    (connected) => {
+      if (connected) {
+        return;
+      }
+
+      currentSamples.ethernet = null;
+      if (deviceStore.primaryChannel !== 'serial') {
+        curveHistory.value = [];
+        chartPanOffset.value = 0;
+      }
+    }
+  );
+
+  watch(
+    () => [deviceStore.serialConnected, deviceStore.ethernetConnected],
+    async () => {
+      await reconcileRecordingLifecycle();
+
+      if (!hasActiveConnection()) {
+        curveHistory.value = [];
+        chartPanOffset.value = 0;
+      }
+    },
+    { immediate: true }
+  );
+
+  watch(
+    () => deviceStore.primaryChannel,
+    (channel, previousChannel) => {
+      if (!channel || channel === previousChannel) {
+        return;
+      }
+
+      chartPanOffset.value = 0;
+      curveHistory.value = [];
+    }
   );
 
   return {
@@ -573,6 +1019,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     targetTemp,
     furnaceState,
     currentMetrics,
+    controllerState,
     latestPidDispatch,
     lastAppliedPid,
     previousAppliedPid,
@@ -584,6 +1031,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     canStartRecording,
     canPauseRecording,
     canStopRecording,
+    openRecordingDirectory,
     panChartWindow,
     jumpChartToLatest,
     ensureRunning,
@@ -595,8 +1043,14 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     applyProfile,
     resetPidDraft,
     syncDraftToChannels,
+    refreshControllerState,
+    refreshPidParameters,
+    refreshControllerSnapshot,
+    setControllerMode,
+    applyManualPwm,
     dispatchPidParameters,
     applyPlantDraft,
-    setTargetTemperature
+    setTargetTemperature,
+    commitTargetTemperature
   };
 });

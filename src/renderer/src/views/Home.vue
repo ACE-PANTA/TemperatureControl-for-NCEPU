@@ -34,10 +34,12 @@ const {
 const {
   chartPanOffset,
   curvePoints,
+  visibleCurveSamples,
   currentTemp,
   targetTemp,
   furnaceState,
   primarySample,
+  controllerState,
   logDirectory,
   visiblePointCount,
   xAxisLabels,
@@ -50,102 +52,399 @@ const {
 
 const { settings } = storeToRefs(configStore);
 
+const CHART_WIDTH = 880;
+const CHART_HEIGHT = 320;
+const CHART_PADDING = 22;
+const Y_AXIS_DIVISION_COUNT = 6;
+const SERIES_ORDER = {
+  furnaceTemp: 0,
+  boardTemp: 1,
+  pwm: 2
+};
+const DEFAULT_Y_AXIS_PROFILES = {
+  furnaceTemp: {
+    label: '炉膛温度',
+    unit: '°C',
+    unitsPerDivision: 50,
+    offset: 0,
+    defaultCenter: 150
+  },
+  boardTemp: {
+    label: '板载温度',
+    unit: '°C',
+    unitsPerDivision: 20,
+    offset: 0,
+    defaultCenter: 50
+  },
+  pwm: {
+    label: 'PWM',
+    unit: '%',
+    unitsPerDivision: 20,
+    offset: 0,
+    defaultCenter: 0
+  }
+};
+
 const serialDetailsOpen = ref(false);
 const ethernetDetailsOpen = ref(false);
 const targetTempDraft = ref('');
 const targetInputFocused = ref(false);
 const chartDragActive = ref(false);
+const chartDragMode = ref('pan');
 const chartDragStartX = ref(0);
+const chartDragStartY = ref(0);
 const chartDragStartOffset = ref(0);
+const chartSurfaceRef = ref(null);
+const chartSvgRef = ref(null);
+const hoveredPointIndex = ref(-1);
+const draggedSeriesKey = ref('');
+const manualPwmDraft = ref('');
 
 const canResumeRecording = computed(() => recordingState.value.active && recordingState.value.paused);
 const canStartRecording = computed(() => !recordingState.value.active);
-
-const compactStats = computed(() => {
-  const values = curvePoints.value;
-  const maxTemp = Math.max(...values);
-  const avgTemp = Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
-
-  return [
-    { label: '峰值', value: `${maxTemp.toFixed(1)} °C` },
-    { label: '均值', value: `${avgTemp} °C` },
-    { label: '控制输出', value: primarySample.value ? `${primarySample.value.controlOutput.toFixed(1)} %` : '--' },
-    { label: '扰动', value: primarySample.value ? primarySample.value.disturbance.toFixed(3) : '--' },
-    { label: '串口', value: serialConnected.value ? '已连接' : '未连接' },
-    { label: '网口', value: ethernetConnected.value ? '已连接' : '未连接' }
-  ];
-});
-
-const chartBounds = computed(() => {
-  const values = [...curvePoints.value, Number(targetTemp.value || 0)];
-  const rawMin = Math.min(...values);
-  const rawMax = Math.max(...values);
-  const span = Math.max(60, rawMax - rawMin);
-  const padding = Math.max(10, span * 0.15);
-  let min = Math.floor((rawMin - padding) / 10) * 10;
-  let max = Math.ceil((rawMax + padding) / 10) * 10;
-
-  if (max - min < 60) {
-    const center = (max + min) / 2;
-    min = Math.floor((center - 30) / 10) * 10;
-    max = Math.ceil((center + 30) / 10) * 10;
+const hasCurrentTemp = computed(() => Number.isFinite(currentTemp.value));
+const hasTargetTemp = computed(() => Number.isFinite(targetTemp.value));
+const hasChartData = computed(() => chartSeriesData.value.length > 0);
+const currentTempText = computed(() => (hasCurrentTemp.value ? `${currentTemp.value.toFixed(1)} °C` : '--'));
+const targetTempText = computed(() => (hasTargetTemp.value ? `${targetTemp.value.toFixed(1)} °C` : '--'));
+const controllerModeLabel = computed(() => {
+  if (controllerState.value.mode === 'AUTO') {
+    return '自动模式';
   }
 
-  return { min, max };
+  if (controllerState.value.mode === 'MAN') {
+    return '手动模式';
+  }
+
+  return '模式未同步';
 });
+const isAutoMode = computed(() => controllerState.value.mode === 'AUTO');
+const isManualMode = computed(() => controllerState.value.mode === 'MAN');
+const currentPwmText = computed(() => Number.isFinite(controllerState.value.pwm) ? `${controllerState.value.pwm.toFixed(0)} %` : '--');
+const controlModeToggleLabel = computed(() => {
+  if (isAutoMode.value) {
+    return '当前自动，点击切到手动';
+  }
 
-function mapValueToY(value) {
-  const width = chartBounds.value.max - chartBounds.value.min || 1;
-  const padding = 22;
-  const height = 320;
-  const ratio = (Number(value) - chartBounds.value.min) / width;
-  return height - padding - ratio * (height - padding * 2);
-}
+  if (isManualMode.value) {
+    return '当前手动，点击切到自动';
+  }
 
-const gridLabels = computed(() => {
-  const step = (chartBounds.value.max - chartBounds.value.min) / 6;
-  return Array.from({ length: 7 }, (_, index) => Number((chartBounds.value.max - step * index).toFixed(0)));
+  return '模式未同步，点击切到自动';
 });
+const controlCommitLabel = computed(() => (isAutoMode.value ? '设定目标温度' : '设定 PWM'));
 
-const chartGridLines = computed(() => gridLabels.value.map((label) => ({ label, y: mapValueToY(label) })));
-
-const targetBandRect = computed(() => {
-  const band = Math.max(4, Number(targetTemp.value || 0) * 0.01);
-  const upper = mapValueToY(Number(targetTemp.value) + band);
-  const lower = mapValueToY(Number(targetTemp.value) - band);
+function createDefaultAxisProfile(key) {
+  const base = DEFAULT_Y_AXIS_PROFILES[key] || {
+    label: key,
+    unit: '',
+    unitsPerDivision: 20,
+    offset: 0,
+    defaultCenter: 0
+  };
 
   return {
-    y: Math.min(upper, lower),
-    height: Math.abs(lower - upper)
+    unitsPerDivision: base.unitsPerDivision,
+    offset: base.offset
   };
+}
+
+function ensureYAxisSettings(seriesList = []) {
+  if (!settings.value.yAxisProfiles || typeof settings.value.yAxisProfiles !== 'object') {
+    settings.value.yAxisProfiles = {};
+  }
+
+  for (const key of Object.keys(DEFAULT_Y_AXIS_PROFILES)) {
+    if (!settings.value.yAxisProfiles[key]) {
+      settings.value.yAxisProfiles[key] = createDefaultAxisProfile(key);
+    }
+  }
+
+  for (const series of seriesList) {
+    if (!settings.value.yAxisProfiles[series.key]) {
+      settings.value.yAxisProfiles[series.key] = createDefaultAxisProfile(series.key);
+    }
+  }
+
+  if (!settings.value.yAxisDisplaySeriesKey || !settings.value.yAxisProfiles[settings.value.yAxisDisplaySeriesKey]) {
+    settings.value.yAxisDisplaySeriesKey = seriesList[0]?.key || 'furnaceTemp';
+  }
+}
+
+function getAxisProfile(key) {
+  ensureYAxisSettings();
+  return settings.value.yAxisProfiles[key] || createDefaultAxisProfile(key);
+}
+
+function getAxisDefaultCenter(key) {
+  return DEFAULT_Y_AXIS_PROFILES[key]?.defaultCenter ?? 0;
+}
+
+function getAxisDefaultUnit(key) {
+  return DEFAULT_Y_AXIS_PROFILES[key]?.unit ?? '';
+}
+
+const chartSeriesData = computed(() => {
+  const registry = new Map();
+
+  visibleCurveSamples.value.forEach((sample, index) => {
+    (sample.series || []).forEach((seriesEntry, seriesIndex) => {
+      if (!registry.has(seriesEntry.key)) {
+        registry.set(seriesEntry.key, {
+          key: seriesEntry.key,
+          label: seriesEntry.label,
+          shortLabel: seriesEntry.shortLabel,
+          unit: seriesEntry.unit,
+          color: seriesEntry.color,
+          points: []
+        });
+      }
+
+      registry.get(seriesEntry.key).points.push({
+        index,
+        value: Number(seriesEntry.value),
+        color: seriesEntry.color,
+        label: seriesEntry.label,
+        unit: seriesEntry.unit,
+        order: seriesIndex
+      });
+    });
+  });
+
+  return Array.from(registry.values())
+    .sort((left, right) => {
+      const leftOrder = SERIES_ORDER[left.key] ?? left.points[0]?.order ?? 99;
+      const rightOrder = SERIES_ORDER[right.key] ?? right.points[0]?.order ?? 99;
+      return leftOrder - rightOrder;
+    });
 });
 
-const chartPath = computed(() => {
-  const width = 880;
-  const height = 320;
-  const padding = 22;
-  const minValue = chartBounds.value.min;
-  const maxValue = chartBounds.value.max;
+watch(
+  chartSeriesData,
+  (seriesList) => {
+    ensureYAxisSettings(seriesList);
+  },
+  { immediate: true }
+);
 
-  return curvePoints.value
-    .map((value, index) => {
-      const x = padding + (index * (width - padding * 2)) / (curvePoints.value.length - 1);
-      const ratio = (value - minValue) / (maxValue - minValue);
-      const y = height - padding - ratio * (height - padding * 2);
+const axisSeriesOptions = computed(() => {
+  const options = new Map();
 
+  chartSeriesData.value.forEach((series) => {
+    options.set(series.key, {
+      key: series.key,
+      label: series.label,
+      unit: series.unit || getAxisDefaultUnit(series.key)
+    });
+  });
+
+  Object.entries(DEFAULT_Y_AXIS_PROFILES).forEach(([key, config]) => {
+    if (!options.has(key)) {
+      options.set(key, {
+        key,
+        label: config.label,
+        unit: config.unit
+      });
+    }
+  });
+
+  return Array.from(options.values()).sort((left, right) => {
+    return (SERIES_ORDER[left.key] ?? 99) - (SERIES_ORDER[right.key] ?? 99);
+  });
+});
+
+const selectedAxisKey = computed({
+  get: () => settings.value.yAxisDisplaySeriesKey || 'furnaceTemp',
+  set: (value) => {
+    settings.value.yAxisDisplaySeriesKey = value;
+  }
+});
+
+const selectedAxisSeries = computed(() => {
+  return axisSeriesOptions.value.find((series) => series.key === selectedAxisKey.value) || axisSeriesOptions.value[0] || null;
+});
+
+function getSeriesValues(seriesKey) {
+  const series = chartSeriesData.value.find((entry) => entry.key === seriesKey);
+  const values = series ? series.points.map((point) => point.value).filter((value) => Number.isFinite(value)) : [];
+
+  if (seriesKey === 'furnaceTemp' && hasTargetTemp.value) {
+    values.push(Number(targetTemp.value));
+  }
+
+  return values;
+}
+
+function getAxisBounds(seriesKey) {
+  const profile = getAxisProfile(seriesKey);
+  const values = getSeriesValues(seriesKey);
+  const unitsPerDivision = Math.max(0.1, Number(profile.unitsPerDivision) || createDefaultAxisProfile(seriesKey).unitsPerDivision);
+  const span = unitsPerDivision * Y_AXIS_DIVISION_COUNT;
+  const baseCenter = values.length
+    ? (Math.min(...values) + Math.max(...values)) / 2
+    : getAxisDefaultCenter(seriesKey);
+  const center = baseCenter + (Number(profile.offset) || 0);
+
+  return {
+    min: center - span / 2,
+    max: center + span / 2,
+    span,
+    unitsPerDivision
+  };
+}
+
+const chartSeries = computed(() => {
+  return chartSeriesData.value.map((series) => ({
+    ...series,
+    path: buildSeriesPath(series.key, series.points)
+  }));
+});
+
+const temperatureSeries = computed(() => chartSeries.value.find((series) => series.key === 'furnaceTemp') || null);
+
+function mapValueToY(value, seriesKey = selectedAxisKey.value) {
+  const bounds = getAxisBounds(seriesKey);
+  const width = bounds.max - bounds.min || 1;
+  const ratio = (Number(value) - bounds.min) / width;
+  return CHART_HEIGHT - CHART_PADDING - ratio * (CHART_HEIGHT - CHART_PADDING * 2);
+}
+
+function mapIndexToX(index, pointCount) {
+  if (pointCount <= 1) {
+    return CHART_PADDING;
+  }
+
+  return CHART_PADDING + (index * (CHART_WIDTH - CHART_PADDING * 2)) / (pointCount - 1);
+}
+
+function buildSeriesPath(seriesKey, points) {
+  if (!points.length) {
+    return '';
+  }
+
+  return points
+    .map((point, index) => {
+      const x = mapIndexToX(point.index, visiblePointCount.value);
+      const y = mapValueToY(point.value, seriesKey);
       return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
     .join(' ');
+}
+
+function formatSeriesValue(entry) {
+  const suffix = entry.unit ? ` ${entry.unit}` : '';
+  return `${Number(entry.value).toFixed(1)}${suffix}`;
+}
+
+function formatAxisLabel(value, unitsPerDivision) {
+  if (unitsPerDivision >= 10) {
+    return Number(value).toFixed(0);
+  }
+
+  if (unitsPerDivision >= 1) {
+    return Number(value).toFixed(1);
+  }
+
+  return Number(value).toFixed(2);
+}
+
+const selectedAxisBounds = computed(() => getAxisBounds(selectedAxisKey.value));
+const selectedAxisUnit = computed(() => selectedAxisSeries.value?.unit || getAxisDefaultUnit(selectedAxisKey.value));
+const chartGridLines = computed(() => {
+  return Array.from({ length: Y_AXIS_DIVISION_COUNT + 1 }, (_, index) => {
+    const value = selectedAxisBounds.value.max - selectedAxisBounds.value.unitsPerDivision * index;
+
+    return {
+      key: `${selectedAxisKey.value}-${index}`,
+      label: formatAxisLabel(value, selectedAxisBounds.value.unitsPerDivision),
+      y: mapValueToY(value, selectedAxisKey.value)
+    };
+  });
 });
 
-const areaPath = computed(() => `${chartPath.value} L 858 298 L 22 298 Z`);
+const chartPath = computed(() => temperatureSeries.value?.path || '');
+
+const areaPath = computed(() => {
+  const series = temperatureSeries.value;
+  if (!series?.points.length) {
+    return '';
+  }
+
+  const firstX = mapIndexToX(series.points[0].index, visiblePointCount.value);
+  const lastX = mapIndexToX(series.points.at(-1).index, visiblePointCount.value);
+  const baseline = CHART_HEIGHT - CHART_PADDING;
+  return `${series.path} L ${lastX.toFixed(2)} ${baseline.toFixed(2)} L ${firstX.toFixed(2)} ${baseline.toFixed(2)} Z`;
+});
+
+const hoveredSample = computed(() => visibleCurveSamples.value[hoveredPointIndex.value] || null);
+
+const hoveredSeriesEntries = computed(() => {
+  if (!hoveredSample.value?.series?.length) {
+    return [];
+  }
+
+  return [...hoveredSample.value.series].sort((left, right) => {
+    return (SERIES_ORDER[left.key] ?? 99) - (SERIES_ORDER[right.key] ?? 99);
+  });
+});
+
+const hoveredX = computed(() => {
+  if (hoveredPointIndex.value < 0 || !visibleCurveSamples.value.length) {
+    return null;
+  }
+
+  return mapIndexToX(hoveredPointIndex.value, visiblePointCount.value);
+});
+
+const hoveredMarkers = computed(() => {
+  if (hoveredX.value === null) {
+    return [];
+  }
+
+  return hoveredSeriesEntries.value.map((entry) => ({
+    key: entry.key,
+    x: hoveredX.value,
+    y: mapValueToY(entry.value, entry.key),
+    color: entry.color,
+    label: entry.label,
+    value: entry.value,
+    unit: entry.unit
+  }));
+});
+
+const hoverTooltip = computed(() => {
+  if (!hoveredSample.value || hoveredX.value === null) {
+    return null;
+  }
+
+  const topPx = hoveredMarkers.value.length
+    ? Math.max(18, Math.min(...hoveredMarkers.value.map((marker) => marker.y)) - 18)
+    : 32;
+
+  return {
+    leftPercent: Math.max(10, Math.min(90, (hoveredX.value / CHART_WIDTH) * 100)),
+    topPx,
+    elapsedSeconds: hoveredSample.value.elapsedSeconds,
+    timestamp: new Date(hoveredSample.value.timestamp).toLocaleTimeString('zh-CN', { hour12: false }),
+    requestedSetpoint: Number(hoveredSample.value.requestedSetpoint || 0),
+    entries: hoveredSeriesEntries.value
+  };
+});
 
 watch(
   () => targetTemp.value,
   (value) => {
     if (!targetInputFocused.value) {
-      targetTempDraft.value = Number(value || 0).toFixed(1);
+      targetTempDraft.value = Number.isFinite(value) ? Number(value).toFixed(1) : '';
     }
+  },
+  { immediate: true }
+);
+
+watch(
+  () => controllerState.value.pwm,
+  (value) => {
+    manualPwmDraft.value = Number.isFinite(value) ? String(Math.round(value)) : '';
   },
   { immediate: true }
 );
@@ -156,24 +455,118 @@ function handleTargetInput(event) {
   simulationStore.setTargetTemperature(value);
 }
 
+async function handleTargetCommit() {
+  await simulationStore.commitTargetTemperature(targetTempDraft.value);
+}
+
+async function handleTargetKeydown(event) {
+  if (event.key === 'Enter') {
+    await handleTargetCommit();
+  }
+}
+
 function handleTargetFocus() {
   targetInputFocused.value = true;
 }
 
 function handleTargetBlur() {
   targetInputFocused.value = false;
-  targetTempDraft.value = Number(targetTemp.value || 0).toFixed(1);
+  targetTempDraft.value = Number.isFinite(targetTemp.value) ? Number(targetTemp.value).toFixed(1) : '';
+}
+
+async function handleManualPwmCommit() {
+  await simulationStore.applyManualPwm(manualPwmDraft.value);
+}
+
+async function handleManualPwmKeydown(event) {
+  if (event.key === 'Enter') {
+    await handleManualPwmCommit();
+  }
+}
+
+async function switchToAutoMode() {
+  await simulationStore.setControllerMode('AUTO');
+}
+
+async function switchToManualMode() {
+  await simulationStore.setControllerMode('MAN');
+}
+
+async function toggleControllerMode() {
+  if (isAutoMode.value) {
+    await switchToManualMode();
+    return;
+  }
+
+  await switchToAutoMode();
+}
+
+function getChartBounds() {
+  return chartSvgRef.value?.getBoundingClientRect() || chartSurfaceRef.value?.getBoundingClientRect() || null;
+}
+
+function pickDraggedSeries(clientY) {
+  const bounds = getChartBounds();
+  if (!bounds || hoveredPointIndex.value < 0) {
+    return null;
+  }
+
+  const normalizedY = ((clientY - bounds.top) / Math.max(bounds.height, 1)) * CHART_HEIGHT;
+  const nearestMarker = hoveredSeriesEntries.value
+    .map((entry) => ({
+      key: entry.key,
+      distance: Math.abs(mapValueToY(entry.value, entry.key) - normalizedY)
+    }))
+    .sort((left, right) => left.distance - right.distance)[0];
+
+  return nearestMarker && nearestMarker.distance <= 16 ? nearestMarker.key : null;
+}
+
+function handleAxisUnitsInput(seriesKey, event) {
+  const nextValue = Number(event.target.value);
+  const profile = getAxisProfile(seriesKey);
+  profile.unitsPerDivision = Number.isFinite(nextValue) && nextValue > 0
+    ? nextValue
+    : createDefaultAxisProfile(seriesKey).unitsPerDivision;
+}
+
+function resetSeriesAxisOffset(seriesKey) {
+  getAxisProfile(seriesKey).offset = 0;
 }
 
 function handleChartPointerDown(event) {
   chartDragActive.value = true;
+  chartDragMode.value = 'pan';
+  draggedSeriesKey.value = '';
   chartDragStartX.value = event.clientX;
-  chartDragStartOffset.value = chartPanOffset.value;
+  chartDragStartY.value = event.clientY;
+  updateHoveredPoint(event.clientX);
+
+  const pickedSeriesKey = pickDraggedSeries(event.clientY);
+  if (pickedSeriesKey) {
+    chartDragMode.value = 'shift-series';
+    draggedSeriesKey.value = pickedSeriesKey;
+    chartDragStartOffset.value = Number(getAxisProfile(pickedSeriesKey).offset) || 0;
+  } else {
+    chartDragStartOffset.value = chartPanOffset.value;
+  }
+
   event.currentTarget.setPointerCapture?.(event.pointerId);
 }
 
 function handleChartPointerMove(event) {
+  updateHoveredPoint(event.clientX);
+
   if (!chartDragActive.value) {
+    return;
+  }
+
+  if (chartDragMode.value === 'shift-series' && draggedSeriesKey.value) {
+    const bounds = getChartBounds();
+    const chartHeight = bounds?.height || event.currentTarget.clientHeight || 1;
+    const deltaY = event.clientY - chartDragStartY.value;
+    const axisBounds = getAxisBounds(draggedSeriesKey.value);
+    getAxisProfile(draggedSeriesKey.value).offset = chartDragStartOffset.value + (deltaY / chartHeight) * axisBounds.span;
     return;
   }
 
@@ -189,7 +582,45 @@ function stopChartDrag(event) {
   }
 
   chartDragActive.value = false;
+  chartDragMode.value = 'pan';
+  draggedSeriesKey.value = '';
   event?.currentTarget?.releasePointerCapture?.(event.pointerId);
+}
+
+function handleChartPointerLeave(event) {
+  stopChartDrag(event);
+  hoveredPointIndex.value = -1;
+}
+
+function updateHoveredPoint(clientX) {
+  const bounds = getChartBounds();
+  if (!bounds || !visibleCurveSamples.value.length) {
+    hoveredPointIndex.value = -1;
+    return;
+  }
+
+  const normalizedX = ((clientX - bounds.left) / Math.max(bounds.width, 1)) * CHART_WIDTH;
+  const plotStartX = CHART_PADDING;
+  const plotEndX = CHART_WIDTH - CHART_PADDING;
+
+  if (normalizedX < plotStartX || normalizedX > plotEndX) {
+    hoveredPointIndex.value = -1;
+    return;
+  }
+
+  const slotCount = Math.max(visiblePointCount.value - 1, 1);
+  const slotWidth = (plotEndX - plotStartX) / slotCount;
+  const nearestIndex = Math.round((normalizedX - plotStartX) / slotWidth);
+
+  if (nearestIndex < 0 || nearestIndex >= visibleCurveSamples.value.length) {
+    hoveredPointIndex.value = -1;
+    return;
+  }
+
+  const nearestX = mapIndexToX(nearestIndex, visiblePointCount.value);
+  hoveredPointIndex.value = Math.abs(normalizedX - nearestX) <= slotWidth / 2
+    ? nearestIndex
+    : -1;
 }
 
 onMounted(async () => {
@@ -209,8 +640,9 @@ onMounted(async () => {
             <p class="panel-intro">曲线区域保持最高优先级，目标温度可在下方直接修改，参考数据改为更紧凑的辅助信息。</p>
           </div>
           <div class="status-cluster">
-            <span class="status-pill status-pill-live">实时仿真运行中</span>
+            <span class="status-pill status-pill-live">实时采集中</span>
             <span class="status-pill">主通道 {{ primaryChannel ? (primaryChannel === 'serial' ? '串口' : '网口') : '未选择' }}</span>
+            <span class="status-pill">控制模式 {{ controllerModeLabel }}</span>
             <span class="status-pill">记录状态 {{ recordingStatusText }}</span>
           </div>
         </div>
@@ -221,87 +653,192 @@ onMounted(async () => {
           <div class="chart-header">
             <div>
               <h3>炉膛温度轨迹</h3>
-              <p>
-                当前温度 {{ currentTemp.toFixed(1) }} °C，目标温度 {{ targetTemp.toFixed(1) }} °C，当前状态 {{ furnaceState }}
-              </p>
+              <p>当前温度 {{ currentTempText }}，目标温度 {{ targetTempText }}，当前状态 {{ furnaceState }}</p>
             </div>
             <div class="chart-legend compact-legend">
-              <span style="color: white;"><i class="legend-dot legend-dot-cyan"></i> 实时温度</span>
-              <span style="color: white;"><i class="legend-dot legend-dot-amber"></i> 目标区间</span>
+              <span v-for="series in chartSeries" :key="series.key" class="chart-series-item">
+                <i class="legend-dot" :style="{ background: series.color }"></i>
+                {{ series.label }}
+              </span>
               <button v-if="chartPanOffset > 0" type="button" class="latest-button" @click="simulationStore.jumpChartToLatest()">回到最新</button>
             </div>
           </div>
 
-          <div
-            class="chart-wrapper"
-            @pointerdown="handleChartPointerDown"
-            @pointermove="handleChartPointerMove"
-            @pointerup="stopChartDrag"
-            @pointercancel="stopChartDrag"
-            @pointerleave="stopChartDrag"
-          >
-            <div class="chart-axis-labels">
-              <span v-for="line in chartGridLines" :key="line.label">{{ line.label }}°C</span>
-            </div>
-            <svg viewBox="0 0 880 320" class="chart-svg" preserveAspectRatio="none">
-              <defs>
-                <linearGradient id="curveFill" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stop-color="rgba(48, 221, 255, 0.38)" />
-                  <stop offset="100%" stop-color="rgba(48, 221, 255, 0.02)" />
-                </linearGradient>
-              </defs>
-              <g>
-                <line
-                  v-for="line in chartGridLines"
-                  :key="line.label"
-                  x1="22"
-                  x2="858"
-                  :y1="line.y"
-                  :y2="line.y"
-                  class="chart-grid"
-                />
-                <rect x="22" :y="targetBandRect.y" width="836" :height="targetBandRect.height" class="target-band" />
-                <path :d="areaPath" fill="url(#curveFill)" />
-                <path :d="chartPath" class="curve-line" />
-              </g>
-            </svg>
-            <div class="timeline-labels">
-              <span v-for="label in xAxisLabels" :key="label">{{ label }}</span>
+          <div class="y-axis-toolbar">
+            <label class="axis-source-control">
+              <span>左侧 Y 轴显示</span>
+              <select v-model="selectedAxisKey">
+                <option v-for="series in axisSeriesOptions" :key="series.key" :value="series.key">
+                  {{ series.label }}
+                </option>
+              </select>
+            </label>
+            <div class="axis-series-controls">
+              <div v-for="series in axisSeriesOptions" :key="series.key" class="axis-series-card">
+                <div class="axis-series-card-head">
+                  <span class="axis-series-name">
+                    <i class="legend-dot" :style="{ background: chartSeries.find((item) => item.key === series.key)?.color || '#7f96ae' }"></i>
+                    {{ series.label }}
+                  </span>
+                  <button type="button" class="axis-reset-button" @click="resetSeriesAxisOffset(series.key)">归位</button>
+                </div>
+                <label>
+                  <span>每格</span>
+                  <input
+                    :value="settings.yAxisProfiles?.[series.key]?.unitsPerDivision"
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    @input="handleAxisUnitsInput(series.key, $event)"
+                  />
+                </label>
+              </div>
             </div>
           </div>
 
-          <div class="axis-note">{{ xAxisStepLabel }}</div>
+          <div class="chart-wrapper">
+            <div class="chart-axis-labels">
+              <span class="axis-caption">{{ selectedAxisSeries?.label || 'Y 轴' }}</span>
+              <span v-for="line in chartGridLines" :key="line.key">{{ line.label }}{{ selectedAxisUnit }}</span>
+            </div>
+            <div
+              ref="chartSurfaceRef"
+              class="chart-surface"
+              @pointerdown="handleChartPointerDown"
+              @pointermove="handleChartPointerMove"
+              @pointerup="stopChartDrag"
+              @pointercancel="stopChartDrag"
+              @pointerleave="handleChartPointerLeave"
+            >
+              <svg ref="chartSvgRef" viewBox="0 0 880 320" class="chart-svg" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id="curveFill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stop-color="rgba(48, 221, 255, 0.38)" />
+                    <stop offset="100%" stop-color="rgba(48, 221, 255, 0.02)" />
+                  </linearGradient>
+                </defs>
+                <g>
+                  <line
+                    v-for="line in chartGridLines"
+                    :key="line.label"
+                    x1="22"
+                    x2="858"
+                    :y1="line.y"
+                    :y2="line.y"
+                    class="chart-grid"
+                  />
+                  <path v-if="areaPath" :d="areaPath" fill="url(#curveFill)" />
+                  <path
+                    v-for="series in chartSeries"
+                    :key="series.key"
+                    :d="series.path"
+                    :class="['curve-line', { 'curve-line-secondary': series.key !== 'furnaceTemp' }]"
+                    :style="{ stroke: series.color }"
+                  />
+                  <line
+                    v-if="hoveredX !== null"
+                    :x1="hoveredX"
+                    :x2="hoveredX"
+                    y1="22"
+                    y2="298"
+                    class="chart-hover-line"
+                  />
+                  <circle
+                    v-for="marker in hoveredMarkers"
+                    :key="marker.key"
+                    :cx="marker.x"
+                    :cy="marker.y"
+                    r="5.2"
+                    class="chart-hover-point"
+                    :style="{ fill: marker.color }"
+                  />
+                </g>
+              </svg>
+
+              <div v-if="!hasChartData" class="chart-empty-state">
+                <strong>暂无实时数据</strong>
+                <span>设备未上报测温数据时，曲线区域保持空白，不再显示任何预设样本。</span>
+              </div>
+
+              <div v-if="hoverTooltip" class="chart-tooltip" :style="{ left: `${hoverTooltip.leftPercent}%`, top: `${hoverTooltip.topPx}px` }">
+                <strong>{{ hoverTooltip.elapsedSeconds }} s</strong>
+                <span class="chart-tooltip-meta">采集时间 {{ hoverTooltip.timestamp }}</span>
+                <span class="chart-tooltip-meta">设定值 {{ hoverTooltip.requestedSetpoint.toFixed(1) }} °C</span>
+                <span v-for="entry in hoverTooltip.entries" :key="entry.key" class="chart-tooltip-row">
+                  <i class="legend-dot" :style="{ background: entry.color }"></i>
+                  {{ entry.label }} {{ formatSeriesValue(entry) }}
+                </span>
+              </div>
+
+              <div class="timeline-labels">
+                <span v-for="label in xAxisLabels" :key="label">{{ label }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="axis-note">{{ xAxisStepLabel }} · 左轴跟随 {{ selectedAxisSeries?.label || '当前曲线' }} · 按住某条曲线上下拖动可单独平移</div>
         </div>
 
         <div class="panel temperature-panel">
           <div class="temperature-layout">
             <div class="target-panel">
               <p class="panel-kicker">TARGET CONTROL</p>
-              <h3>目标温度</h3>
-              <div class="target-input-row">
-                <input :value="targetTempDraft" type="number" min="0" max="1200" step="1" @input="handleTargetInput" @focus="handleTargetFocus" @blur="handleTargetBlur" />
-                <span>°C</span>
+              <h3>控制下发</h3>
+              <div class="control-mode-row">
+                <button type="button" class="action-button primary mode-toggle-button" @click="toggleControllerMode">{{ controlModeToggleLabel }}</button>
               </div>
-              <p class="target-note">输入过程会实时同步设定值，不需要额外确认。</p>
+
+              <div v-if="isAutoMode" class="target-input-row">
+                <input
+                  :value="targetTempDraft"
+                  type="number"
+                  min="0"
+                  max="1200"
+                  step="0.1"
+                  @input="handleTargetInput"
+                  @focus="handleTargetFocus"
+                  @blur="handleTargetBlur"
+                  @keydown="handleTargetKeydown"
+                  placeholder="输入目标温度"
+                />
+                <span>°C</span>
+                <button type="button" class="action-button primary" @click="handleTargetCommit">{{ controlCommitLabel }}</button>
+              </div>
+
+              <div v-else class="target-input-row">
+                <input
+                  v-model="manualPwmDraft"
+                  type="number"
+                  min="-100"
+                  max="100"
+                  step="1"
+                  placeholder="输入 PWM"
+                  @keydown="handleManualPwmKeydown"
+                />
+                <span>%</span>
+                <button type="button" class="action-button primary" @click="handleManualPwmCommit">{{ controlCommitLabel }}</button>
+              </div>
+
+              <p class="target-note">
+                {{ isAutoMode ? '自动模式下可设置目标温度，修改后需明确点击下发。' : '手动模式下直接下发 PWM 输出，范围为 -100% 到 100%。' }}
+              </p>
+              <div class="support-note-row control-meta-row">
+                <span>当前模式：{{ controllerModeLabel }}</span>
+                <span>当前 PWM：{{ currentPwmText }}</span>
+                <span>目标温度：{{ targetTempText }}</span>
+              </div>
             </div>
 
-            <div class="live-panel">
-              <article class="primary-metric-card">
+            <div class="live-panel simplified-live-panel">
+              <article class="primary-metric-card live-hero-card">
                 <span>当前温度</span>
-                <strong>{{ currentTemp.toFixed(1) }} °C</strong>
+                <strong>{{ currentTempText }}</strong>
               </article>
-              <article class="primary-metric-card secondary-card">
+              <article class="primary-metric-card secondary-card live-hero-card">
                 <span>当前状态</span>
                 <strong>{{ furnaceState }}</strong>
               </article>
             </div>
-          </div>
-
-          <div class="mini-stats-grid">
-            <article v-for="item in compactStats" :key="item.label" class="mini-stat-card">
-              <span>{{ item.label }}</span>
-              <strong>{{ item.value }}</strong>
-            </article>
           </div>
 
           <div class="support-note-row">
@@ -547,6 +1084,7 @@ onMounted(async () => {
 .recording-actions,
 .recording-meta,
 .temperature-layout,
+.control-mode-row,
 .target-input-row,
 .support-note-row {
   display: flex;
@@ -578,7 +1116,6 @@ onMounted(async () => {
 .chart-header h3,
 .target-panel h3,
 .primary-metric-card strong,
-.mini-stat-card strong,
 .device-card strong,
 .detail-toggle,
 .event-time {
@@ -595,7 +1132,6 @@ onMounted(async () => {
 .recording-head p,
 .recording-meta span,
 .target-note,
-.mini-stat-card span,
 .primary-metric-card span,
 .support-note-row span {
   color: var(--tc-text-secondary);
@@ -612,7 +1148,6 @@ onMounted(async () => {
 .scan-actions,
 .form-grid,
 .device-list,
-.mini-stats-grid,
 .event-list,
 .detail-stack,
 .live-panel {
@@ -655,6 +1190,17 @@ onMounted(async () => {
   font-size: clamp(0.72rem, 0.86vw, 0.8rem);
 }
 
+.control-mode-row {
+  margin-top: 0.85rem;
+}
+
+.chart-series-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  color: var(--tc-text-primary);
+}
+
 .legend-dot {
   display: inline-block;
   width: 0.6rem;
@@ -672,7 +1218,115 @@ onMounted(async () => {
   grid-template-columns: minmax(3.2rem, 4.2rem) minmax(0, 1fr);
   gap: 0.75rem;
   align-items: stretch;
+}
+
+.y-axis-toolbar {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1rem;
+}
+
+.axis-source-control {
+  display: inline-grid;
+  gap: 0.4rem;
+  max-width: 18rem;
+}
+
+.axis-source-control span,
+.axis-series-card label span,
+.axis-caption {
+  color: var(--tc-text-dim);
+  font-size: 0.74rem;
+}
+
+.axis-source-control select,
+.axis-series-card input {
+  width: 100%;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(132, 154, 181, 0.16);
+  background: rgba(5, 17, 28, 0.82);
+  color: var(--tc-text-primary);
+}
+
+.axis-source-control select {
+  padding: 0.65rem 0.8rem;
+}
+
+.axis-series-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.axis-series-card {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.85rem 0.9rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(122, 148, 177, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.axis-series-card-head,
+.axis-series-name,
+.axis-series-card label {
+  display: flex;
+  align-items: center;
+}
+
+.axis-series-card-head,
+.axis-series-card label {
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.axis-series-name {
+  color: var(--tc-text-primary);
+}
+
+.axis-series-card input {
+  max-width: 6.5rem;
+  padding: 0.55rem 0.7rem;
+  text-align: right;
+}
+
+.axis-series-card em {
+  color: var(--tc-text-secondary);
+  font-style: normal;
+  min-width: 2.5rem;
+  text-align: right;
+}
+
+.axis-reset-button {
+  border: 1px solid rgba(120, 149, 187, 0.2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--tc-text-secondary);
+  padding: 0.3rem 0.65rem;
+  cursor: pointer;
+}
+
+.chart-surface {
+  position: relative;
+  display: grid;
+  gap: 0.35rem;
   touch-action: none;
+}
+
+.chart-empty-state {
+  position: absolute;
+  inset: 1.5rem 0 2.1rem;
+  display: grid;
+  place-content: center;
+  gap: 0.45rem;
+  text-align: center;
+  padding: 1.25rem;
+  color: var(--tc-text-secondary);
+  pointer-events: none;
+}
+
+.chart-empty-state strong {
+  color: var(--tc-text-primary);
 }
 
 .chart-axis-labels {
@@ -682,6 +1336,11 @@ onMounted(async () => {
   color: var(--tc-text-dim);
   font-size: clamp(0.68rem, 0.82vw, 0.76rem);
   padding: 0.3rem 0 1.2rem;
+}
+
+.axis-caption {
+  color: #8be7ff;
+  margin-bottom: 0.35rem;
 }
 
 .chart-svg {
@@ -700,12 +1359,6 @@ onMounted(async () => {
   stroke-width: 1;
 }
 
-.target-band {
-  fill: rgba(255, 179, 71, 0.08);
-  stroke: rgba(255, 179, 71, 0.24);
-  stroke-dasharray: 8 6;
-}
-
 .curve-line {
   fill: none;
   stroke: #31ddff;
@@ -715,8 +1368,57 @@ onMounted(async () => {
   filter: drop-shadow(0 0 8px rgba(49, 221, 255, 0.25));
 }
 
+.curve-line-secondary {
+  stroke-width: 3;
+  filter: none;
+  opacity: 0.94;
+}
+
+.chart-hover-line {
+  stroke: rgba(255, 255, 255, 0.26);
+  stroke-width: 1.4;
+  stroke-dasharray: 6 5;
+}
+
+.chart-hover-point {
+  stroke: rgba(4, 17, 28, 0.96);
+  stroke-width: 2.2;
+}
+
+.chart-tooltip {
+  position: absolute;
+  z-index: 2;
+  transform: translate(-50%, -100%);
+  min-width: 10rem;
+  max-width: min(18rem, 72vw);
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.95rem;
+  border: 1px solid rgba(120, 149, 187, 0.22);
+  background: rgba(4, 17, 28, 0.94);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
+  display: grid;
+  gap: 0.32rem;
+  pointer-events: none;
+}
+
+.chart-tooltip strong,
+.chart-tooltip-row {
+  color: var(--tc-text-primary);
+}
+
+.chart-tooltip-meta {
+  color: var(--tc-text-secondary);
+  font-size: 0.76rem;
+}
+
+.chart-tooltip-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+}
+
 .timeline-labels {
-  grid-column: 2;
   display: flex;
   justify-content: space-between;
   color: var(--tc-text-dim);
@@ -785,7 +1487,6 @@ onMounted(async () => {
 }
 
 .primary-metric-card,
-.mini-stat-card,
 .recording-panel,
 .device-card,
 .adapter-summary,
@@ -809,23 +1510,12 @@ onMounted(async () => {
   font-size: clamp(1rem, 1.45vw, 1.2rem);
 }
 
-.mini-stats-grid {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  margin-top: 0.95rem;
+.simplified-live-panel {
+  align-content: start;
 }
 
-.mini-stat-card {
-  padding: 0.75rem 0.8rem;
-  display: grid;
-  gap: 0.25rem;
-}
-
-.mini-stat-card span {
-  font-size: 0.73rem;
-}
-
-.mini-stat-card strong {
-  font-size: 0.92rem;
+.live-hero-card {
+  min-height: 7.2rem;
 }
 
 .support-note-row {
@@ -991,11 +1681,11 @@ onMounted(async () => {
 }
 
 @media (max-width: 62rem) {
-  .mini-stats-grid,
   .form-grid,
   .protocol-switch,
   .scan-actions,
-  .live-panel {
+  .live-panel,
+  .axis-series-controls {
     grid-template-columns: 1fr;
   }
 
@@ -1025,14 +1715,5 @@ onMounted(async () => {
     align-items: stretch;
   }
 
-  .mini-stats-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 34rem) {
-  .mini-stats-grid {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

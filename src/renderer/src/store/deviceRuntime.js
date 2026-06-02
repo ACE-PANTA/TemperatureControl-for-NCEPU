@@ -52,9 +52,9 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
     eventTimeline.value = [{ time, text }, ...eventTimeline.value].slice(0, 10);
   }
 
-  function pushAlert({ tone = 'danger', title, message, ttl = 4200 }) {
+  function pushAlert({ tone = 'danger', title, message, ttl = 4200, actionLabel = '', action = null }) {
     const id = `${tone}-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
-    transientAlerts.value = [...transientAlerts.value, { id, tone, title, message }];
+    transientAlerts.value = [...transientAlerts.value, { id, tone, title, message, actionLabel, action }];
 
     if (ttl > 0) {
       window.setTimeout(() => dismissAlert(id), ttl);

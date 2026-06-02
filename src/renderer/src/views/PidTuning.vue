@@ -10,7 +10,7 @@ const deviceStore = useDeviceRuntimeStore();
 const simulationStore = useSimulationRuntimeStore();
 const configStore = useSystemConfigStore();
 
-const { pidDraft, plantDraft, currentMetrics, latestPidDispatch, lastAppliedPid, previousAppliedPid, logDirectory } = storeToRefs(simulationStore);
+const { pidDraft, currentMetrics, latestPidDispatch, lastAppliedPid, previousAppliedPid, logDirectory, controllerState, currentTemp, targetTemp } = storeToRefs(simulationStore);
 const { primaryChannel } = storeToRefs(deviceStore);
 
 const tuningProfiles = [
@@ -20,23 +20,15 @@ const tuningProfiles = [
 ];
 
 const derivedIndicators = computed(() => [
-  { label: '当前超调', value: `${currentMetrics.value.overshootPercent.toFixed(2)}%` },
-  { label: '稳定时间', value: currentMetrics.value.settlingTime === '--' ? '--' : `${currentMetrics.value.settlingTime} s` },
-  { label: '采样周期', value: `${pidDraft.value.sampleTime} ms` },
-  { label: '输出上限', value: `${pidDraft.value.outputLimit}%` },
+  { label: '控制模式', value: controllerState.value.mode === 'AUTO' ? '自动' : controllerState.value.mode === 'MAN' ? '手动' : '--' },
+  { label: '当前目标', value: Number.isFinite(targetTemp.value) ? `${targetTemp.value.toFixed(1)} °C` : '--' },
+  { label: '反馈温度', value: Number.isFinite(currentTemp.value) ? `${currentTemp.value.toFixed(1)} °C` : '--' },
+  { label: '当前 PWM', value: Number.isFinite(controllerState.value.pwm) ? `${controllerState.value.pwm.toFixed(0)}%` : '--' },
   { label: '控制输出', value: `${currentMetrics.value.controlOutput.toFixed(1)}%` },
-  { label: '扰动量', value: `${currentMetrics.value.disturbance.toFixed(3)}` }
+  { label: '主通道', value: primaryChannel.value ? (primaryChannel.value === 'serial' ? '串口' : '网口') : '未连接' }
 ]);
 
-const plantSummary = computed(() => {
-  return `K ${formatPlantValue(plantDraft.value.gain)} / ζ ${formatPlantValue(plantDraft.value.dampingRatio)} / ωn ${formatPlantValue(plantDraft.value.naturalFrequency)} / L ${formatPlantValue(plantDraft.value.transportDelay, 1)} s`;
-});
-
 function formatPidValue(value, digits = 2) {
-  return Number(value || 0).toFixed(digits);
-}
-
-function formatPlantValue(value, digits = 2) {
   return Number(value || 0).toFixed(digits);
 }
 
@@ -52,14 +44,19 @@ async function dispatchPid() {
   await simulationStore.dispatchPidParameters();
 }
 
-function applyPlantDraft() {
-  simulationStore.applyPlantDraft();
+async function queryPid() {
+  await simulationStore.refreshPidParameters();
+}
+
+async function queryState() {
+  await simulationStore.refreshControllerState();
 }
 
 onMounted(async () => {
   configStore.loadPersistedState();
   await deviceStore.initializeCommunication();
   await simulationStore.ensureRunning();
+  await simulationStore.refreshControllerSnapshot({ silent: true });
 });
 </script>
 
@@ -71,9 +68,9 @@ onMounted(async () => {
           <div>
             <p class="panel-kicker">PID PARAMETER TUNING</p>
             <h2>控制参数整定</h2>
-            <p class="intro">PID 参数优先下发到当前主通道；被控对象只有一套共享模型，串口和网口只是数据链路不同。</p>
+            <p class="intro">该页面直接使用控制器真实协议进行 PID 查询和下发，当前文档支持 Kp / Ki / Kd 三项参数。</p>
           </div>
-          <span class="mode-badge">{{ pidDraft.mode }}控制</span>
+          <span class="mode-badge">{{ controllerState.mode === 'AUTO' ? '自动模式' : controllerState.mode === 'MAN' ? '手动模式' : '模式未同步' }}</span>
         </div>
 
         <PrimaryChannelPanel />
@@ -82,7 +79,7 @@ onMounted(async () => {
           <section class="workspace-card tuning-card">
             <div class="section-head">
               <h3>整定工作区</h3>
-              <p>滑块和数值框联动，确认后再下发。</p>
+              <p>调整草稿后点击确认下发；也可以随时从设备重新查询当前 PID。</p>
             </div>
 
             <div class="pid-grid">
@@ -106,35 +103,9 @@ onMounted(async () => {
               </div>
             </div>
 
-            <div class="form-grid">
-              <label>
-                <span>输出限幅</span>
-                <input v-model.number="pidDraft.outputLimit" type="number" min="10" max="100" />
-              </label>
-              <label>
-                <span>采样周期(ms)</span>
-                <input v-model.number="pidDraft.sampleTime" type="number" min="100" max="2000" step="100" />
-              </label>
-              <label>
-                <span>死区(°C)</span>
-                <input v-model.number="pidDraft.deadband" type="number" min="0.1" max="10" step="0.1" />
-              </label>
-              <label>
-                <span>设定斜率(°C/min)</span>
-                <input v-model.number="pidDraft.setpointRamp" type="number" min="1" max="50" />
-              </label>
-              <label>
-                <span>控制模式</span>
-                <select v-model="pidDraft.mode">
-                  <option>自动</option>
-                  <option>手动</option>
-                  <option>串级</option>
-                </select>
-              </label>
-            </div>
-
             <div class="action-row">
               <button class="action-button primary" @click="dispatchPid">确认并下发</button>
+              <button class="action-button tertiary" @click="queryPid">查询当前 PID</button>
               <button class="action-button secondary" @click="resetPid">恢复推荐值</button>
             </div>
 
@@ -174,64 +145,19 @@ onMounted(async () => {
       <div class="panel profile-panel">
         <div class="panel-heading compact">
           <div>
-            <p class="panel-kicker">SHARED PROCESS MODEL</p>
-            <h2>被控对象参数</h2>
+            <p class="panel-kicker">DEVICE STATUS</p>
+            <h2>控制器状态</h2>
           </div>
         </div>
-
-        <div class="formula-panel">
-          <div class="formula-head">
-            <h3>参考公式</h3>
-            <span>共享于串口与网口</span>
-          </div>
-          <div class="equation-line">
-            <span>y¨ + 2ζω<sub>n</sub>y˙ + ω<sub>n</sub><sup>2</sup>y = Kω<sub>n</sub><sup>2</sup>u(t - L)</span>
-          </div>
-          <div class="formula-tags">
-            <span>K: 系统增益</span>
-            <span>ζ: 阻尼比</span>
-            <span>ωn: 固有频率</span>
-            <span>L: 传输延迟</span>
-          </div>
-        </div>
-
-        <div class="form-grid plant-grid">
-          <label>
-            <span>系统增益 K</span>
-            <input v-model.number="plantDraft.gain" type="number" min="0.1" max="3" step="0.01" />
-          </label>
-          <label>
-            <span>阻尼比 ζ</span>
-            <input v-model.number="plantDraft.dampingRatio" type="number" min="0.05" max="1.2" step="0.01" />
-          </label>
-          <label>
-            <span>固有频率 ωn</span>
-            <input v-model.number="plantDraft.naturalFrequency" type="number" min="0.05" max="1" step="0.01" />
-          </label>
-          <label>
-            <span>传输延迟 L(s)</span>
-            <input v-model.number="plantDraft.transportDelay" type="number" min="1" max="10" step="0.1" />
-          </label>
-          <label>
-            <span>加热上限(°C)</span>
-            <input v-model.number="plantDraft.heaterCeiling" type="number" min="400" max="900" step="1" />
-          </label>
-          <label>
-            <span>初始温度(°C)</span>
-            <input v-model.number="plantDraft.initialTemp" type="number" min="20" max="500" step="1" />
-          </label>
-        </div>
-
         <div class="action-row compact-actions">
-          <button class="action-button primary" type="button" @click="applyPlantDraft">应用对象参数</button>
+          <button class="action-button tertiary" type="button" @click="queryState">查询控制状态</button>
+          <button class="action-button tertiary" type="button" @click="queryPid">查询 PID 参数</button>
         </div>
-
-        <p class="dispatch-note">当前对象：{{ plantSummary }}</p>
 
         <div class="panel-heading compact section-heading">
           <div>
             <p class="panel-kicker">TUNING PROFILES</p>
-            <h2>推荐策略与指标</h2>
+            <h2>推荐策略与实时指标</h2>
           </div>
         </div>
 
@@ -253,10 +179,14 @@ onMounted(async () => {
         </div>
 
         <div class="note-box">
-          <h3>运行说明</h3>
-          <p>当前整定结果会驱动共享对象仿真，串口和网口只是不同的采集与下发链路。</p>
+          <h3>回传说明</h3>
+          <p>状态查询使用 !GET=STATE，PID 查询使用 !GET=PID，参数下发使用 !PID=KP,KI,KD。</p>
           <p v-if="logDirectory">日志目录：{{ logDirectory }}</p>
           <p>当前主通道：{{ primaryChannel ? (primaryChannel === 'serial' ? '串口' : '网口') : '未连接' }}</p>
+          <p>控制模式：{{ controllerState.mode || '未同步' }}</p>
+          <p>目标温度：{{ Number.isFinite(targetTemp) ? `${targetTemp.toFixed(1)} °C` : '--' }}</p>
+          <p>反馈温度：{{ Number.isFinite(currentTemp) ? `${currentTemp.toFixed(1)} °C` : '--' }}</p>
+          <p>当前 PWM：{{ Number.isFinite(controllerState.pwm) ? `${controllerState.pwm.toFixed(0)} %` : '--' }}</p>
         </div>
       </div>
     </div>

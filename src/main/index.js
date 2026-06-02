@@ -13,6 +13,23 @@ let serialConnection = null
 let serialConnectionMeta = null
 let tcpConnection = null
 let tcpConnectionMeta = null
+let serialReceiveBuffer = Buffer.alloc(0)
+let serialProtocolFlushTimer = null
+let serialCommandChain = Promise.resolve()
+const serialProtocolWaiters = new Set()
+
+const DATASCOPE_FRAME_HEADER = '$'.charCodeAt(0)
+const DATASCOPE_FRAME_LENGTH = 14
+const DATASCOPE_FRAME_END_MARKER = 13
+const SERIAL_PROTOCOL_HEADER = '!'.charCodeAt(0)
+const SERIAL_PROTOCOL_SEPARATOR = '*'.charCodeAt(0)
+const SERIAL_PROTOCOL_IDLE_FLUSH_MS = 60
+const SERIAL_PROTOCOL_COMMAND_TERMINATOR = '\r\n'
+const DATASCOPE_CHANNEL_DEFINITIONS = [
+  { key: 'furnaceTemp', label: '炉膛温度', unit: '°C' },
+  { key: 'pwm', label: 'PWM', unit: '%' },
+  { key: 'boardTemp', label: '板载温度', unit: '°C' }
+]
 
 const ELEVATION_FLAG = '--elevation-attempted'
 
@@ -155,12 +172,18 @@ async function appendChannelSamples(channel, rows, directory, sessionId) {
 function closeSerialConnection() {
   if (!serialConnection) {
     serialConnectionMeta = null
+    serialReceiveBuffer = Buffer.alloc(0)
+    clearTimeout(serialProtocolFlushTimer)
+    serialProtocolFlushTimer = null
     return Promise.resolve()
   }
 
   const port = serialConnection
   serialConnection = null
   serialConnectionMeta = null
+  serialReceiveBuffer = Buffer.alloc(0)
+  clearTimeout(serialProtocolFlushTimer)
+  serialProtocolFlushTimer = null
 
   return new Promise((resolve, reject) => {
     if (!port.isOpen) {
@@ -177,6 +200,445 @@ function closeSerialConnection() {
       resolve()
     })
   })
+}
+
+function computeSerialChecksum(body) {
+  let checksum = SERIAL_PROTOCOL_HEADER
+
+  for (const char of body) {
+    checksum ^= char.charCodeAt(0)
+  }
+
+  return checksum
+}
+
+function formatChecksum(value) {
+  return value.toString(16).toUpperCase().padStart(2, '0')
+}
+
+function buildSerialProtocolPacket(body, { includeChecksum = false } = {}) {
+  if (!includeChecksum) {
+    return `!${body}`
+  }
+
+  return `!${body}*${formatChecksum(computeSerialChecksum(body))}`
+}
+
+function isHexByte(value) {
+  return /^[0-9A-Fa-f]{2}$/.test(value)
+}
+
+function parseKeyValueBody(body) {
+  return body.split(',').reduce((result, entry) => {
+    const [rawKey, rawValue] = entry.split(':')
+    if (!rawKey) {
+      return result
+    }
+
+    result[rawKey.trim().toUpperCase()] = rawValue?.trim() ?? ''
+    return result
+  }, {})
+}
+
+function parseSerialProtocolPacket(packet) {
+  if (!packet.startsWith('!') || packet.length < 2) {
+    return null
+  }
+
+  const starIndex = packet.lastIndexOf('*')
+  let body = packet.slice(1)
+  let hasChecksum = false
+
+  if (starIndex >= 0) {
+    if (starIndex + 3 !== packet.length) {
+      return null
+    }
+
+    body = packet.slice(1, starIndex)
+    const checksumText = packet.slice(starIndex + 1)
+    if (!isHexByte(checksumText)) {
+      return null
+    }
+
+    const checksum = Number.parseInt(checksumText, 16)
+    if (computeSerialChecksum(body) !== checksum) {
+      return {
+        kind: 'invalid',
+        packet,
+        body,
+        checksum,
+        expectedChecksum: computeSerialChecksum(body)
+      }
+    }
+
+    hasChecksum = true
+  }
+
+  if (body.startsWith('ACK=')) {
+    return {
+      kind: 'ack',
+      packet,
+      body,
+      hasChecksum,
+      status: body.slice(4).trim().toUpperCase()
+    }
+  }
+
+  if (body.startsWith('STATE=')) {
+    const fields = parseKeyValueBody(body.slice(6))
+    return {
+      kind: 'state',
+      packet,
+      body,
+      hasChecksum,
+      mode: (fields.MODE || '').toUpperCase() || null,
+      pwm: Number.parseFloat(fields.PWM ?? ''),
+      goal: Number.parseFloat(fields.GOAL ?? ''),
+      feedback: Number.parseFloat(fields.FB ?? '')
+    }
+  }
+
+  if (body.startsWith('PID=')) {
+    const fields = parseKeyValueBody(body.slice(4))
+    return {
+      kind: 'pid',
+      packet,
+      body,
+      hasChecksum,
+      kp: Number.parseFloat(fields.KP ?? ''),
+      ki: Number.parseFloat(fields.KI ?? ''),
+      kd: Number.parseFloat(fields.KD ?? '')
+    }
+  }
+
+  return {
+    kind: 'unknown',
+    packet,
+    body,
+    hasChecksum
+  }
+}
+
+function findSerialProtocolBoundary(buffer) {
+  let boundary = -1
+
+  for (let index = 1; index < buffer.length; index += 1) {
+    if ([0x0d, 0x0a, 0x00].includes(buffer[index])) {
+      boundary = index
+      break
+    }
+
+    if (buffer[index] === SERIAL_PROTOCOL_HEADER || buffer[index] === DATASCOPE_FRAME_HEADER) {
+      boundary = index
+      break
+    }
+  }
+
+  return boundary
+}
+
+function settleSerialProtocolWaiters(message) {
+  for (const waiter of [...serialProtocolWaiters]) {
+    if (waiter.kind && waiter.kind !== message.kind) {
+      continue
+    }
+
+    if (typeof waiter.match === 'function' && !waiter.match(message)) {
+      continue
+    }
+
+    clearTimeout(waiter.timer)
+    serialProtocolWaiters.delete(waiter)
+    waiter.resolve(message)
+    return true
+  }
+
+  return false
+}
+
+function broadcastSerialDebug(direction, summary, extra = {}) {
+  void direction
+  void summary
+  void extra
+}
+
+function summarizeSerialAscii(buffer, maxLength = 120) {
+  return buffer
+    .subarray(0, Math.min(buffer.length, maxLength))
+    .toString('ascii')
+    .replace(/[^\x20-\x7E]/g, '.') || '<non-printable>'
+}
+
+function broadcastSerialProtocol(message) {
+  if (!message) {
+    return
+  }
+
+  broadcastSerialDebug('rx', message.packet || message.body || '收到协议消息', {
+    kind: message.kind,
+    packet: message.packet,
+    body: message.body,
+    status: message.status ?? null
+  })
+
+  broadcastToRenderers('device:serial-protocol', {
+    ...message,
+    timestamp: Date.now()
+  })
+  settleSerialProtocolWaiters(message)
+}
+
+function waitForSerialProtocolMessage({ kind, timeoutMs = 1500, match } = {}) {
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      kind,
+      match,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        serialProtocolWaiters.delete(waiter)
+        reject(new Error('等待设备回传超时'))
+      }, timeoutMs)
+    }
+
+    serialProtocolWaiters.add(waiter)
+  })
+}
+
+function queueSerialCommand(task) {
+  const queued = serialCommandChain.then(task, task)
+  serialCommandChain = queued.catch(() => null)
+  return queued
+}
+
+function writeSerialPacket(packet) {
+  if (!serialConnection?.isOpen) {
+    return Promise.reject(new Error('串口未连接'))
+  }
+
+  const outboundPacket = `${packet.replace(/[\r\n]+$/g, '')}${SERIAL_PROTOCOL_COMMAND_TERMINATOR}`
+  const outboundBuffer = Buffer.from(outboundPacket, 'ascii')
+
+  return new Promise((resolve, reject) => {
+    serialConnection.write(outboundBuffer, (error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+
+      serialConnection.drain((drainError) => {
+        if (drainError) {
+          reject(drainError)
+          return
+        }
+        resolve()
+      })
+    })
+  })
+}
+
+function tryParseSerialProtocolPacket(buffer) {
+  const starIndex = buffer.indexOf(SERIAL_PROTOCOL_SEPARATOR, 1)
+  if (starIndex >= 0) {
+    if (buffer.length < starIndex + 3) {
+      return { needsMore: true }
+    }
+
+    const checksumText = buffer.subarray(starIndex + 1, starIndex + 3).toString('ascii')
+    if (!isHexByte(checksumText)) {
+      return { invalid: true, consumeLength: Math.max(1, starIndex + 1) }
+    }
+
+    let consumeLength = starIndex + 3
+    while (consumeLength < buffer.length && [0x0d, 0x0a, 0x00].includes(buffer[consumeLength])) {
+      consumeLength += 1
+    }
+
+    return {
+      consumeLength,
+      parsed: parseSerialProtocolPacket(buffer.subarray(0, starIndex + 3).toString('ascii'))
+    }
+  }
+
+  const boundary = findSerialProtocolBoundary(buffer)
+  if (boundary < 0) {
+    return { needsMore: true }
+  }
+
+  let consumeLength = boundary
+  while (consumeLength < buffer.length && [0x0d, 0x0a, 0x00].includes(buffer[consumeLength])) {
+    consumeLength += 1
+  }
+
+  return {
+    consumeLength,
+    parsed: parseSerialProtocolPacket(buffer.subarray(0, boundary).toString('ascii'))
+  }
+}
+
+function flushPendingSerialProtocolBuffer() {
+  clearTimeout(serialProtocolFlushTimer)
+  serialProtocolFlushTimer = null
+
+  if (!serialReceiveBuffer.length || serialReceiveBuffer[0] !== SERIAL_PROTOCOL_HEADER) {
+    return
+  }
+
+  let consumeLength = serialReceiveBuffer.length
+  while (consumeLength > 0 && [0x0d, 0x0a, 0x00].includes(serialReceiveBuffer[consumeLength - 1])) {
+    consumeLength -= 1
+  }
+
+  if (consumeLength <= 1) {
+    serialReceiveBuffer = serialReceiveBuffer.subarray(Math.max(consumeLength, 1))
+    return
+  }
+
+  const packet = serialReceiveBuffer.subarray(0, consumeLength).toString('ascii')
+  const parsed = parseSerialProtocolPacket(packet)
+
+  if (parsed) {
+    broadcastSerialProtocol(parsed)
+  } else {
+    broadcastSerialDebug('rx', `空闲收口后仍无法解析: ${summarizeSerialAscii(serialReceiveBuffer)}`, {
+      kind: 'malformed',
+      packet
+    })
+  }
+
+  serialReceiveBuffer = serialReceiveBuffer.subarray(consumeLength)
+  while (serialReceiveBuffer.length && [0x0d, 0x0a, 0x00].includes(serialReceiveBuffer[0])) {
+    serialReceiveBuffer = serialReceiveBuffer.subarray(1)
+  }
+
+  if (serialReceiveBuffer.length) {
+    handleSerialChunk(Buffer.alloc(0))
+  }
+}
+
+function scheduleSerialProtocolFlush() {
+  clearTimeout(serialProtocolFlushTimer)
+  serialProtocolFlushTimer = setTimeout(() => {
+    flushPendingSerialProtocolBuffer()
+  }, SERIAL_PROTOCOL_IDLE_FLUSH_MS)
+}
+
+function broadcastToRenderers(channel, payload) {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send(channel, payload)
+    }
+  }
+}
+
+function decodeDataScopeFrame(frame) {
+  if (!frame || frame.length !== DATASCOPE_FRAME_LENGTH) {
+    return null
+  }
+
+  if (frame[0] !== DATASCOPE_FRAME_HEADER || frame[DATASCOPE_FRAME_LENGTH - 1] !== DATASCOPE_FRAME_END_MARKER) {
+    return null
+  }
+
+  const timestamp = Date.now()
+  const telemetry = DATASCOPE_CHANNEL_DEFINITIONS.map((definition, index) => ({
+    ...definition,
+    channel: index + 1,
+    value: Number(frame.readFloatLE(1 + index * 4).toFixed(2))
+  }))
+
+  return {
+    source: 'stm32-datascope',
+    timestamp,
+    frameLength: DATASCOPE_FRAME_LENGTH,
+    telemetry,
+    furnaceTemp: telemetry[0]?.value ?? null,
+    pwm: telemetry[1]?.value ?? null,
+    boardTemp: telemetry[2]?.value ?? null
+  }
+}
+
+function handleSerialChunk(chunk) {
+  if (chunk?.length) {
+    serialReceiveBuffer = Buffer.concat([serialReceiveBuffer, chunk])
+
+    const commandStart = chunk.indexOf(SERIAL_PROTOCOL_HEADER)
+    if (commandStart >= 0) {
+      const rawFragment = summarizeSerialAscii(chunk.subarray(commandStart))
+      broadcastSerialDebug('rx', `原始串口片段: ${rawFragment}`, {
+        kind: 'raw',
+        packet: rawFragment
+      })
+    }
+  }
+
+  while (serialReceiveBuffer.length) {
+    const commandStart = serialReceiveBuffer.indexOf(SERIAL_PROTOCOL_HEADER)
+    const frameStart = serialReceiveBuffer.indexOf(DATASCOPE_FRAME_HEADER)
+
+    if (commandStart < 0 && frameStart < 0) {
+      serialReceiveBuffer = Buffer.alloc(0)
+      return
+    }
+
+    const nextStart = [commandStart, frameStart].filter((index) => index >= 0).sort((left, right) => left - right)[0]
+
+    if (nextStart > 0) {
+      serialReceiveBuffer = serialReceiveBuffer.subarray(nextStart)
+    }
+
+    if (!serialReceiveBuffer.length) {
+      return
+    }
+
+    if (serialReceiveBuffer[0] === DATASCOPE_FRAME_HEADER) {
+      clearTimeout(serialProtocolFlushTimer)
+      serialProtocolFlushTimer = null
+
+      if (serialReceiveBuffer.length < DATASCOPE_FRAME_LENGTH) {
+        return
+      }
+
+      const frame = serialReceiveBuffer.subarray(0, DATASCOPE_FRAME_LENGTH)
+      const decoded = decodeDataScopeFrame(frame)
+
+      if (!decoded) {
+        serialReceiveBuffer = serialReceiveBuffer.subarray(1)
+        continue
+      }
+
+      broadcastToRenderers('device:serial-frame', decoded)
+      serialReceiveBuffer = serialReceiveBuffer.subarray(DATASCOPE_FRAME_LENGTH)
+      continue
+    }
+
+    if (serialReceiveBuffer[0] === SERIAL_PROTOCOL_HEADER) {
+      const result = tryParseSerialProtocolPacket(serialReceiveBuffer)
+      if (result.needsMore) {
+        scheduleSerialProtocolFlush()
+        return
+      }
+
+      clearTimeout(serialProtocolFlushTimer)
+      serialProtocolFlushTimer = null
+
+      if (result.invalid || !result.parsed) {
+        const summary = summarizeSerialAscii(serialReceiveBuffer, 40)
+        broadcastSerialDebug('rx', `无法解析协议片段: ${summary}`, {
+          kind: 'malformed',
+          packet: summary
+        })
+        serialReceiveBuffer = serialReceiveBuffer.subarray(result.consumeLength || 1)
+        continue
+      }
+
+      broadcastSerialProtocol(result.parsed)
+      serialReceiveBuffer = serialReceiveBuffer.subarray(result.consumeLength)
+      continue
+    }
+
+    serialReceiveBuffer = serialReceiveBuffer.subarray(1)
+  }
 }
 
 function closeTcpConnection() {
@@ -314,6 +776,9 @@ ipcMain.handle('device:open-serial-port', async (_, options) => {
   })
 
   serialConnection = port
+  serialReceiveBuffer = Buffer.alloc(0)
+  clearTimeout(serialProtocolFlushTimer)
+  serialProtocolFlushTimer = null
   serialConnectionMeta = {
     path,
     baudRate: Number(baudRate),
@@ -322,9 +787,17 @@ ipcMain.handle('device:open-serial-port', async (_, options) => {
     parity
   }
 
+  port.on('data', handleSerialChunk)
+  port.on('error', (error) => {
+    console.error(`[serial:error] ${error.message}`)
+  })
+
   port.once('close', () => {
     serialConnection = null
     serialConnectionMeta = null
+    serialReceiveBuffer = Buffer.alloc(0)
+    clearTimeout(serialProtocolFlushTimer)
+    serialProtocolFlushTimer = null
   })
 
   return {
@@ -336,6 +809,32 @@ ipcMain.handle('device:open-serial-port', async (_, options) => {
 ipcMain.handle('device:close-serial-port', async () => {
   await closeSerialConnection()
   return { connected: false }
+})
+
+ipcMain.handle('device:send-serial-command', async (_, options) => {
+  const { body, expectKind = 'ack', timeoutMs = 1500 } = options || {}
+  if (!body) {
+    throw new Error('未提供串口指令体')
+  }
+
+  return queueSerialCommand(async () => {
+    const packet = buildSerialProtocolPacket(body)
+    const responsePromise = expectKind
+      ? waitForSerialProtocolMessage({ kind: expectKind, timeoutMs })
+      : Promise.resolve(null)
+
+    await writeSerialPacket(packet)
+    const response = await responsePromise
+
+    if (response?.kind === 'ack' && response.status === 'ERR') {
+      throw new Error('设备返回 ACK=ERR')
+    }
+
+    return {
+      packet,
+      response
+    }
+  })
 })
 
 ipcMain.handle('device:get-network-interfaces', async () => {
@@ -426,6 +925,19 @@ ipcMain.handle('device:get-default-log-directory', async () => {
   const directory = getDefaultLogDirectory()
   await mkdir(directory, { recursive: true })
   return directory
+})
+
+ipcMain.handle('device:open-path-in-shell', async (_, targetPath) => {
+  if (!targetPath) {
+    throw new Error('目标路径为空')
+  }
+
+  const result = await shell.openPath(targetPath)
+  if (result) {
+    throw new Error(result)
+  }
+
+  return true
 })
 
 ipcMain.handle('device:choose-log-directory', async (_, defaultPath) => {

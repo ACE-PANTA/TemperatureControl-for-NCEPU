@@ -11,7 +11,22 @@ const defaultSystemSettings = {
   autoRecordingEnabled: true,
   autoPauseOnDisconnect: true,
   xAxisSecondsPerDivision: 5,
-  xAxisDivisionCount: 6
+  xAxisDivisionCount: 6,
+  yAxisDisplaySeriesKey: 'furnaceTemp',
+  yAxisProfiles: {
+    furnaceTemp: {
+      unitsPerDivision: 50,
+      offset: 0
+    },
+    boardTemp: {
+      unitsPerDivision: 20,
+      offset: 0
+    },
+    pwm: {
+      unitsPerDivision: 20,
+      offset: 0
+    }
+  }
 };
 
 function clone(value) {
@@ -38,7 +53,16 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
       }
 
       const parsed = JSON.parse(raw);
-      Object.assign(settings, defaultSystemSettings, parsed.settings || {});
+      const mergedSettings = {
+        ...clone(defaultSystemSettings),
+        ...(parsed.settings || {}),
+        yAxisProfiles: {
+          ...clone(defaultSystemSettings.yAxisProfiles),
+          ...(parsed.settings?.yAxisProfiles || {})
+        }
+      };
+
+      Object.assign(settings, mergedSettings);
       Object.assign(pidDraft, defaultPidDraft, parsed.pidDraft || {});
       Object.assign(plantDraft, defaultPlantDrafts.serial, parsed.plantDraft || parsed.plantDrafts?.serial || {});
     } catch {

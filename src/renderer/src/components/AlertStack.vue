@@ -7,6 +7,14 @@ const deviceStore = useDeviceRuntimeStore();
 const { transientAlerts, warningAlerts } = storeToRefs(deviceStore);
 
 const alerts = computed(() => [...warningAlerts.value, ...transientAlerts.value]);
+
+async function handleAlertAction(alert) {
+  if (typeof alert.action !== 'function') {
+    return;
+  }
+
+  await alert.action();
+}
 </script>
 
 <template>
@@ -16,6 +24,9 @@ const alerts = computed(() => [...warningAlerts.value, ...transientAlerts.value]
         <div>
           <strong>{{ alert.title }}</strong>
           <p>{{ alert.message }}</p>
+          <button v-if="alert.actionLabel" type="button" class="alert-action" @click="handleAlertAction(alert)">
+            {{ alert.actionLabel }}
+          </button>
         </div>
         <button
           type="button"
@@ -96,6 +107,20 @@ const alerts = computed(() => [...warningAlerts.value, ...transientAlerts.value]
 
 .alert-close:hover {
   opacity: 1;
+}
+
+.alert-action {
+  margin-top: 0.7rem;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff7df;
+  border-radius: 0.75rem;
+  padding: 0.48rem 0.78rem;
+  cursor: pointer;
+}
+
+.alert-action:hover {
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .stack-slide-enter-active,

@@ -6,13 +6,30 @@ const deviceApi = {
   listSerialPorts: () => ipcRenderer.invoke('device:list-serial-ports'),
   openSerialPort: (options) => ipcRenderer.invoke('device:open-serial-port', options),
   closeSerialPort: () => ipcRenderer.invoke('device:close-serial-port'),
+  onSerialFrame: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('device:serial-frame', listener)
+    return () => ipcRenderer.removeListener('device:serial-frame', listener)
+  },
+  sendSerialCommand: (options) => ipcRenderer.invoke('device:send-serial-command', options),
+  onSerialProtocol: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('device:serial-protocol', listener)
+    return () => ipcRenderer.removeListener('device:serial-protocol', listener)
+  },
+  onSerialDebug: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('device:serial-debug', listener)
+    return () => ipcRenderer.removeListener('device:serial-debug', listener)
+  },
   getNetworkInterfaces: () => ipcRenderer.invoke('device:get-network-interfaces'),
   scanNetworkDevices: (options) => ipcRenderer.invoke('device:scan-network-devices', options),
   connectNetworkDevice: (options) => ipcRenderer.invoke('device:connect-network-device', options),
   disconnectNetworkDevice: () => ipcRenderer.invoke('device:disconnect-network-device'),
   appendChannelSamples: (payload) => ipcRenderer.invoke('device:append-channel-samples', payload),
   getDefaultLogDirectory: () => ipcRenderer.invoke('device:get-default-log-directory'),
-  chooseLogDirectory: (defaultPath) => ipcRenderer.invoke('device:choose-log-directory', defaultPath)
+  chooseLogDirectory: (defaultPath) => ipcRenderer.invoke('device:choose-log-directory', defaultPath),
+  openPathInShell: (targetPath) => ipcRenderer.invoke('device:open-path-in-shell', targetPath)
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

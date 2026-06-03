@@ -319,6 +319,13 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
     }
 
     initialized.value = true;
+
+    if (deviceApi?.onSerialDebug) {
+      deviceApi.onSerialDebug((payload) => {
+        console.log('[serial-debug]', payload);
+      });
+    }
+
     await loadNetworkAdapters();
     await Promise.all([searchSerialPorts(), searchEthernetDevices()]);
   }

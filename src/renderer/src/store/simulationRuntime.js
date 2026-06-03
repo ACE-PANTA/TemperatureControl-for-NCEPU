@@ -23,6 +23,67 @@ function toNumeric(value, fallback = 0) {
   return Number.isFinite(numericValue) ? numericValue : fallback;
 }
 
+function normalizeControllerModeValue(mode) {
+  const normalizedMode = String(mode ?? '').trim().toUpperCase();
+
+  if (normalizedMode === '0' || normalizedMode === 'AUTO') {
+    return 'AUTO';
+  }
+
+  if (normalizedMode === '1' || normalizedMode === 'MAN' || normalizedMode === 'MANUAL') {
+    return 'MAN';
+  }
+
+  return normalizedMode || null;
+}
+
+function parseStateBodyFields(body) {
+  if (typeof body !== 'string' || !body.startsWith('STATE=')) {
+    return null;
+  }
+
+  return body.slice(6).split(',').reduce((result, entry) => {
+    const separatorIndex = entry.includes(':') ? entry.indexOf(':') : entry.indexOf('=');
+    if (separatorIndex < 0) {
+      return result;
+    }
+
+    const key = entry.slice(0, separatorIndex).trim().toUpperCase();
+    const value = entry.slice(separatorIndex + 1).trim();
+    if (key) {
+      result[key] = value;
+    }
+    return result;
+  }, {});
+}
+
+function parseTenthsValue(value, fallback = Number.NaN) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue / 10 : fallback;
+}
+
+function normalizeControllerSnapshot(snapshot) {
+  if (!snapshot || snapshot.kind !== 'state') {
+    return snapshot;
+  }
+
+  const rawFields = parseStateBodyFields(snapshot.body);
+  if (!rawFields) {
+    return {
+      ...snapshot,
+      mode: normalizeControllerModeValue(snapshot.mode)
+    };
+  }
+
+  return {
+    ...snapshot,
+    mode: normalizeControllerModeValue(rawFields.MODE ?? snapshot.mode),
+    pwm: Number.isFinite(Number(rawFields.PWM)) ? Number(rawFields.PWM) : snapshot.pwm,
+    goal: parseTenthsValue(rawFields.GOAL, snapshot.goal),
+    feedback: parseTenthsValue(rawFields.FB, snapshot.feedback)
+  };
+}
+
 function getSeriesStyle(key, index = 0) {
   if (key && SERIES_STYLE_MAP[key]) {
     return SERIES_STYLE_MAP[key];
@@ -98,6 +159,7 @@ function createRecordingSessionId() {
 export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => {
   const deviceStore = useDeviceRuntimeStore();
   const configStore = useSystemConfigStore();
+  let controllerRefreshTimer = null;
 
   const currentSamples = reactive({
     serial: null,
@@ -286,23 +348,25 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   }
 
   function applyControllerState(snapshot) {
-    controllerState.mode = snapshot.mode || controllerState.mode;
-    controllerState.pwm = Number.isFinite(snapshot.pwm) ? snapshot.pwm : controllerState.pwm;
-    controllerState.goal = Number.isFinite(snapshot.goal) ? snapshot.goal : controllerState.goal;
-    controllerState.feedback = Number.isFinite(snapshot.feedback) ? snapshot.feedback : controllerState.feedback;
+    const normalizedSnapshot = normalizeControllerSnapshot(snapshot);
+
+    controllerState.mode = normalizedSnapshot.mode || controllerState.mode;
+    controllerState.pwm = Number.isFinite(normalizedSnapshot.pwm) ? normalizedSnapshot.pwm : controllerState.pwm;
+    controllerState.goal = Number.isFinite(normalizedSnapshot.goal) ? normalizedSnapshot.goal : controllerState.goal;
+    controllerState.feedback = Number.isFinite(normalizedSnapshot.feedback) ? normalizedSnapshot.feedback : controllerState.feedback;
     controllerState.updatedAt = Date.now();
 
-    if (Number.isFinite(snapshot.goal)) {
-      requestedSetpoint.value = snapshot.goal;
+    if (Number.isFinite(normalizedSnapshot.goal)) {
+      requestedSetpoint.value = normalizedSnapshot.goal;
     }
 
     if (currentSamples.serial) {
       currentSamples.serial = {
         ...currentSamples.serial,
-        requestedSetpoint: Number.isFinite(snapshot.goal) ? snapshot.goal : currentSamples.serial.requestedSetpoint,
-        controlOutput: Number.isFinite(snapshot.pwm) ? snapshot.pwm : currentSamples.serial.controlOutput,
-        temperature: Number.isFinite(snapshot.feedback) ? snapshot.feedback : currentSamples.serial.temperature,
-        mode: snapshot.mode || currentSamples.serial.mode
+        requestedSetpoint: Number.isFinite(normalizedSnapshot.goal) ? normalizedSnapshot.goal : currentSamples.serial.requestedSetpoint,
+        controlOutput: Number.isFinite(normalizedSnapshot.pwm) ? normalizedSnapshot.pwm : currentSamples.serial.controlOutput,
+        temperature: Number.isFinite(normalizedSnapshot.feedback) ? normalizedSnapshot.feedback : currentSamples.serial.temperature,
+        mode: normalizedSnapshot.mode || currentSamples.serial.mode
       };
     }
   }
@@ -328,6 +392,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return;
     }
 
+    console.log('[serial-protocol]', payload);
+
     serialProtocolState.lastMessageAt = payload.timestamp || Date.now();
 
     if (payload.kind === 'ack') {
@@ -339,7 +405,9 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
 
     if (payload.kind === 'state') {
-      applyControllerState(payload);
+      const normalizedPayload = normalizeControllerSnapshot(payload);
+      console.log('[serial-protocol:normalized-state]', normalizedPayload);
+      applyControllerState(normalizedPayload);
       return;
     }
 
@@ -402,6 +470,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   async function refreshControllerState({ silent = false } = {}) {
     try {
       const response = await sendSerialProtocolCommand('GET=STATE', 'state', '状态查询');
+      console.log('[refresh-controller-state:response]', response);
+      console.log('[refresh-controller-state:normalized]', normalizeControllerSnapshot(response));
       if (!silent) {
         deviceStore.pushAlert({
           tone: 'success',
@@ -444,6 +514,17 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     await refreshPidParameters({ silent });
   }
 
+  function scheduleControllerStateRefresh(delayMs = 450) {
+    if (controllerRefreshTimer) {
+      window.clearTimeout(controllerRefreshTimer);
+    }
+
+    controllerRefreshTimer = window.setTimeout(() => {
+      controllerRefreshTimer = null;
+      refreshControllerState({ silent: true });
+    }, delayMs);
+  }
+
   async function setControllerMode(mode) {
     const normalizedMode = String(mode || '').toUpperCase();
     if (!['AUTO', 'MAN'].includes(normalizedMode)) {
@@ -452,7 +533,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
     try {
       await sendSerialProtocolCommand(`MODE=${normalizedMode}`, 'ack', '模式切换');
-      await refreshControllerState({ silent: true });
+      applyControllerState({ mode: normalizedMode });
+      scheduleControllerStateRefresh();
       deviceStore.pushAlert({
         tone: 'success',
         title: '模式切换成功',
@@ -475,7 +557,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
     try {
       await sendSerialProtocolCommand(`PWM=${normalizedPwm}`, 'ack', 'PWM 下发');
-      await refreshControllerState({ silent: true });
+      applyControllerState({ pwm: normalizedPwm });
+      scheduleControllerStateRefresh();
       deviceStore.pushAlert({
         tone: 'success',
         title: 'PWM 已下发',
@@ -810,6 +893,10 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
   async function stopRuntime() {
     runtimeStarted.value = false;
+    if (controllerRefreshTimer) {
+      window.clearTimeout(controllerRefreshTimer);
+      controllerRefreshTimer = null;
+    }
     detachSerialFrameListener();
     detachSerialProtocolListener();
     await Promise.all([flushChannelBatch('serial'), flushChannelBatch('ethernet')]);
@@ -879,11 +966,10 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
 
     const clampedTarget = Math.min(1200, Math.max(0, normalizedTarget));
-    requestedSetpoint.value = clampedTarget;
-
     try {
       await sendSerialProtocolCommand(`TEMP=${clampedTarget.toFixed(1)}`, 'ack', '目标温度下发');
-      await refreshControllerState({ silent: true });
+      applyControllerState({ goal: clampedTarget });
+      scheduleControllerStateRefresh();
       deviceStore.pushAlert({
         tone: 'success',
         title: '目标温度已下发',

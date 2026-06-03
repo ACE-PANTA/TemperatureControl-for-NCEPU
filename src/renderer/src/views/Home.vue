@@ -56,6 +56,7 @@ const CHART_WIDTH = 880;
 const CHART_HEIGHT = 320;
 const CHART_PADDING = 22;
 const Y_AXIS_DIVISION_COUNT = 6;
+const DEFAULT_TARGET_TEMPERATURE = 40;
 const SERIES_ORDER = {
   furnaceTemp: 0,
   boardTemp: 1,
@@ -87,7 +88,7 @@ const DEFAULT_Y_AXIS_PROFILES = {
 
 const serialDetailsOpen = ref(false);
 const ethernetDetailsOpen = ref(false);
-const targetTempDraft = ref('');
+const targetTempDraft = ref(String(DEFAULT_TARGET_TEMPERATURE));
 const targetInputFocused = ref(false);
 const chartDragActive = ref(false);
 const chartDragMode = ref('pan');
@@ -133,6 +134,18 @@ const controlModeToggleLabel = computed(() => {
   return '模式未同步，点击切到自动';
 });
 const controlCommitLabel = computed(() => (isAutoMode.value ? '设定目标温度' : '设定 PWM'));
+const controlModeButtonClass = computed(() => {
+  if (isAutoMode.value) {
+    return 'mode-button-auto';
+  }
+
+  if (isManualMode.value) {
+    return 'mode-button-manual';
+  }
+
+  return 'mode-button-unsynced';
+});
+const controlCommitButtonClass = computed(() => (isAutoMode.value ? 'mode-button-auto' : 'mode-button-manual'));
 
 function createDefaultAxisProfile(key) {
   const base = DEFAULT_Y_AXIS_PROFILES[key] || {
@@ -302,8 +315,8 @@ const chartSeries = computed(() => {
 
 const temperatureSeries = computed(() => chartSeries.value.find((series) => series.key === 'furnaceTemp') || null);
 
-function mapValueToY(value, seriesKey = selectedAxisKey.value) {
-  const bounds = getAxisBounds(seriesKey);
+function mapValueToY(value, axisKey = selectedAxisKey.value) {
+  const bounds = getAxisBounds(axisKey);
   const width = bounds.max - bounds.min || 1;
   const ratio = (Number(value) - bounds.min) / width;
   return CHART_HEIGHT - CHART_PADDING - ratio * (CHART_HEIGHT - CHART_PADDING * 2);
@@ -353,11 +366,13 @@ const selectedAxisUnit = computed(() => selectedAxisSeries.value?.unit || getAxi
 const chartGridLines = computed(() => {
   return Array.from({ length: Y_AXIS_DIVISION_COUNT + 1 }, (_, index) => {
     const value = selectedAxisBounds.value.max - selectedAxisBounds.value.unitsPerDivision * index;
+    const y = mapValueToY(value, selectedAxisKey.value);
 
     return {
       key: `${selectedAxisKey.value}-${index}`,
       label: formatAxisLabel(value, selectedAxisBounds.value.unitsPerDivision),
-      y: mapValueToY(value, selectedAxisKey.value)
+      y,
+      topPercent: (y / CHART_HEIGHT) * 100
     };
   });
 });
@@ -432,16 +447,6 @@ const hoverTooltip = computed(() => {
 });
 
 watch(
-  () => targetTemp.value,
-  (value) => {
-    if (!targetInputFocused.value) {
-      targetTempDraft.value = Number.isFinite(value) ? Number(value).toFixed(1) : '';
-    }
-  },
-  { immediate: true }
-);
-
-watch(
   () => controllerState.value.pwm,
   (value) => {
     manualPwmDraft.value = Number.isFinite(value) ? String(Math.round(value)) : '';
@@ -450,13 +455,14 @@ watch(
 );
 
 function handleTargetInput(event) {
-  const value = event.target.value;
-  targetTempDraft.value = value;
-  simulationStore.setTargetTemperature(value);
+  targetTempDraft.value = event.target.value;
 }
 
 async function handleTargetCommit() {
-  await simulationStore.commitTargetTemperature(targetTempDraft.value);
+  const committed = await simulationStore.commitTargetTemperature(targetTempDraft.value);
+  if (committed) {
+    targetTempDraft.value = Number(targetTempDraft.value).toFixed(1);
+  }
 }
 
 async function handleTargetKeydown(event) {
@@ -471,7 +477,6 @@ function handleTargetFocus() {
 
 function handleTargetBlur() {
   targetInputFocused.value = false;
-  targetTempDraft.value = Number.isFinite(targetTemp.value) ? Number(targetTemp.value).toFixed(1) : '';
 }
 
 async function handleManualPwmCommit() {
@@ -699,7 +704,16 @@ onMounted(async () => {
           <div class="chart-wrapper">
             <div class="chart-axis-labels">
               <span class="axis-caption">{{ selectedAxisSeries?.label || 'Y 轴' }}</span>
-              <span v-for="line in chartGridLines" :key="line.key">{{ line.label }}{{ selectedAxisUnit }}</span>
+              <div class="chart-axis-scale">
+                <span
+                  v-for="line in chartGridLines"
+                  :key="line.key"
+                  class="chart-axis-tick"
+                  :style="{ top: `${line.topPercent}%` }"
+                >
+                  {{ line.label }}{{ selectedAxisUnit }}
+                </span>
+              </div>
             </div>
             <div
               ref="chartSurfaceRef"
@@ -776,7 +790,7 @@ onMounted(async () => {
             </div>
           </div>
 
-          <div class="axis-note">{{ xAxisStepLabel }} · 左轴跟随 {{ selectedAxisSeries?.label || '当前曲线' }} · 按住某条曲线上下拖动可单独平移</div>
+          <div class="axis-note">{{ xAxisStepLabel }} · 左轴刻度跟随 {{ selectedAxisSeries?.label || '当前曲线' }} · 按住某条曲线上下拖动可单独平移</div>
         </div>
 
         <div class="panel temperature-panel">
@@ -785,7 +799,7 @@ onMounted(async () => {
               <p class="panel-kicker">TARGET CONTROL</p>
               <h3>控制下发</h3>
               <div class="control-mode-row">
-                <button type="button" class="action-button primary mode-toggle-button" @click="toggleControllerMode">{{ controlModeToggleLabel }}</button>
+                <button type="button" :class="['action-button', 'mode-toggle-button', controlModeButtonClass]" @click="toggleControllerMode">{{ controlModeToggleLabel }}</button>
               </div>
 
               <div v-if="isAutoMode" class="target-input-row">
@@ -802,10 +816,10 @@ onMounted(async () => {
                   placeholder="输入目标温度"
                 />
                 <span>°C</span>
-                <button type="button" class="action-button primary" @click="handleTargetCommit">{{ controlCommitLabel }}</button>
+                <button type="button" :class="['action-button', controlCommitButtonClass]" @click="handleTargetCommit">{{ controlCommitLabel }}</button>
               </div>
 
-              <div v-else class="target-input-row">
+              <div v-else-if="isManualMode" class="target-input-row">
                 <input
                   v-model="manualPwmDraft"
                   type="number"
@@ -816,11 +830,33 @@ onMounted(async () => {
                   @keydown="handleManualPwmKeydown"
                 />
                 <span>%</span>
-                <button type="button" class="action-button primary" @click="handleManualPwmCommit">{{ controlCommitLabel }}</button>
+                <button type="button" :class="['action-button', controlCommitButtonClass]" @click="handleManualPwmCommit">{{ controlCommitLabel }}</button>
+              </div>
+
+              <div v-else class="target-input-row">
+                <input
+                  :value="targetTempDraft"
+                  type="number"
+                  min="0"
+                  max="1200"
+                  step="0.1"
+                  @input="handleTargetInput"
+                  @focus="handleTargetFocus"
+                  @blur="handleTargetBlur"
+                  @keydown="handleTargetKeydown"
+                  placeholder="输入目标温度"
+                  disabled
+                />
+                <span>°C</span>
+                <button type="button" :class="['action-button', controlCommitButtonClass]" disabled>{{ controlCommitLabel }}</button>
               </div>
 
               <p class="target-note">
-                {{ isAutoMode ? '自动模式下可设置目标温度，修改后需明确点击下发。' : '手动模式下直接下发 PWM 输出，范围为 -100% 到 100%。' }}
+                {{ isAutoMode
+                  ? '自动模式下可设置目标温度，默认草稿为 40 °C，修改后需明确点击下发。'
+                  : isManualMode
+                    ? '手动模式下直接下发 PWM 输出，范围为 -100% 到 100%。'
+                    : '当前模式尚未同步，先点击上方按钮切换并等待状态刷新。' }}
               </p>
               <div class="support-note-row control-meta-row">
                 <span>当前模式：{{ controllerModeLabel }}</span>
@@ -1330,17 +1366,29 @@ onMounted(async () => {
 }
 
 .chart-axis-labels {
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
+  display: grid;
+  grid-template-rows: auto minmax(18rem, min(42vw, 20rem));
   color: var(--tc-text-dim);
   font-size: clamp(0.68rem, 0.82vw, 0.76rem);
-  padding: 0.3rem 0 1.2rem;
+  padding-top: 0.3rem;
 }
 
 .axis-caption {
   color: #8be7ff;
   margin-bottom: 0.35rem;
+}
+
+.chart-axis-scale {
+  position: relative;
+  min-height: 18rem;
+  height: min(42vw, 20rem);
+}
+
+.chart-axis-tick {
+  position: absolute;
+  right: 0;
+  transform: translateY(-50%);
+  white-space: nowrap;
 }
 
 .chart-svg {
@@ -1598,9 +1646,21 @@ onMounted(async () => {
   background: rgba(0, 137, 176, 0.22);
 }
 
-.action-button.primary {
+.action-button.primary,
+.action-button.mode-button-auto {
   color: #021826;
   background: linear-gradient(135deg, #41e3ff, #7ee8ff);
+}
+
+.action-button.mode-button-manual {
+  color: #fff6ea;
+  background: linear-gradient(135deg, #ff8b3d, #ffb347);
+}
+
+.action-button.mode-button-unsynced {
+  color: var(--tc-text-primary);
+  background: linear-gradient(135deg, rgba(58, 82, 114, 0.9), rgba(33, 49, 71, 0.9));
+  border-color: rgba(120, 149, 187, 0.2);
 }
 
 .action-button.secondary {

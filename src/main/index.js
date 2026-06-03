@@ -230,7 +230,13 @@ function isHexByte(value) {
 
 function parseKeyValueBody(body) {
   return body.split(',').reduce((result, entry) => {
-    const [rawKey, rawValue] = entry.split(':')
+    const separatorIndex = entry.includes(':') ? entry.indexOf(':') : entry.indexOf('=')
+    if (separatorIndex < 0) {
+      return result
+    }
+
+    const rawKey = entry.slice(0, separatorIndex)
+    const rawValue = entry.slice(separatorIndex + 1)
     if (!rawKey) {
       return result
     }
@@ -238,6 +244,29 @@ function parseKeyValueBody(body) {
     result[rawKey.trim().toUpperCase()] = rawValue?.trim() ?? ''
     return result
   }, {})
+}
+
+function normalizeControllerMode(rawMode) {
+  const normalized = String(rawMode ?? '').trim().toUpperCase()
+
+  if (normalized === '0' || normalized === 'AUTO') {
+    return 'AUTO'
+  }
+
+  if (normalized === '1' || normalized === 'MAN' || normalized === 'MANUAL') {
+    return 'MAN'
+  }
+
+  return normalized || null
+}
+
+function parseTenthsValue(rawValue) {
+  const numericValue = Number.parseFloat(rawValue ?? '')
+  if (!Number.isFinite(numericValue)) {
+    return Number.NaN
+  }
+
+  return numericValue / 10
 }
 
 function parseSerialProtocolPacket(packet) {
@@ -286,16 +315,24 @@ function parseSerialProtocolPacket(packet) {
 
   if (body.startsWith('STATE=')) {
     const fields = parseKeyValueBody(body.slice(6))
-    return {
+    const parsed = {
       kind: 'state',
       packet,
       body,
       hasChecksum,
-      mode: (fields.MODE || '').toUpperCase() || null,
+      mode: normalizeControllerMode(fields.MODE),
       pwm: Number.parseFloat(fields.PWM ?? ''),
-      goal: Number.parseFloat(fields.GOAL ?? ''),
-      feedback: Number.parseFloat(fields.FB ?? '')
+      goal: parseTenthsValue(fields.GOAL),
+      feedback: parseTenthsValue(fields.FB)
     }
+
+    console.log('[serial:state:parsed]', {
+      packet,
+      fields,
+      parsed
+    })
+
+    return parsed
   }
 
   if (body.startsWith('PID=')) {
@@ -357,9 +394,15 @@ function settleSerialProtocolWaiters(message) {
 }
 
 function broadcastSerialDebug(direction, summary, extra = {}) {
-  void direction
-  void summary
-  void extra
+  const payload = {
+    direction,
+    summary,
+    ...extra,
+    timestamp: Date.now()
+  }
+
+  console.log(`[serial:${direction}] ${summary}`, extra)
+  broadcastToRenderers('device:serial-debug', payload)
 }
 
 function summarizeSerialAscii(buffer, maxLength = 120) {

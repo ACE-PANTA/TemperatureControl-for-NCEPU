@@ -1,6 +1,12 @@
 import { reactive, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
-import { defaultPidDraft, defaultPlantDrafts } from '../services/pidSimulation.js';
+import {
+  defaultPidDraft,
+  defaultCascadeDraft,
+  defaultHybridDraft,
+  defaultNetDraft,
+  defaultPlantDrafts
+} from '../services/pidSimulation.js';
 
 const STORAGE_KEY = 'temperature-control:system-config';
 const deviceApi = window.deviceApi;
@@ -36,6 +42,9 @@ function clone(value) {
 export const useSystemConfigStore = defineStore('systemConfig', () => {
   const settings = reactive(clone(defaultSystemSettings));
   const pidDraft = reactive(clone(defaultPidDraft));
+  const cascadeDraft = reactive(clone(defaultCascadeDraft));
+  const hybridDraft = reactive(clone(defaultHybridDraft));
+  const netDraft = reactive(clone(defaultNetDraft));
   const plantDraft = reactive(clone(defaultPlantDrafts.serial));
   const initialized = ref(false);
 
@@ -64,6 +73,9 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
 
       Object.assign(settings, mergedSettings);
       Object.assign(pidDraft, defaultPidDraft, parsed.pidDraft || {});
+      Object.assign(cascadeDraft, defaultCascadeDraft, parsed.cascadeDraft || {});
+      Object.assign(hybridDraft, defaultHybridDraft, parsed.hybridDraft || {});
+      Object.assign(netDraft, defaultNetDraft, parsed.netDraft || {});
       Object.assign(plantDraft, defaultPlantDrafts.serial, parsed.plantDraft || parsed.plantDrafts?.serial || {});
     } catch {
       Object.assign(settings, defaultSystemSettings);
@@ -82,6 +94,9 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
       JSON.stringify({
         settings: clone(settings),
         pidDraft: clone(pidDraft),
+        cascadeDraft: clone(cascadeDraft),
+        hybridDraft: clone(hybridDraft),
+        netDraft: clone(netDraft),
         plantDraft: clone(plantDraft)
       })
     );
@@ -120,13 +135,16 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
   loadPersistedState();
 
   watch(
-    () => JSON.stringify({ settings, pidDraft, plantDraft }),
+    () => JSON.stringify({ settings, pidDraft, cascadeDraft, hybridDraft, netDraft, plantDraft }),
     () => persistState()
   );
 
   return {
     settings,
     pidDraft,
+    cascadeDraft,
+    hybridDraft,
+    netDraft,
     plantDraft,
     loadPersistedState,
     ensureDefaultLogDirectory,

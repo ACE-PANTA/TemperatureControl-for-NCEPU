@@ -7,16 +7,19 @@ import { spawn, spawnSync } from 'child_process'
 import net from 'net'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { SerialPort } from 'serialport'
-import icon from '../../resources/icon.png?asset'
+import icon from '../../resources/logo.png?asset'
 
 let serialConnection = null
 let serialConnectionMeta = null
 let tcpConnection = null
 let tcpConnectionMeta = null
+let tcpReceiveBuffer = ''
 let serialReceiveBuffer = Buffer.alloc(0)
 let serialProtocolFlushTimer = null
 let serialCommandChain = Promise.resolve()
+let tcpCommandChain = Promise.resolve()
 const serialProtocolWaiters = new Set()
+const tcpProtocolWaiters = new Set()
 
 const DATASCOPE_FRAME_HEADER = '$'.charCodeAt(0)
 const DATASCOPE_FRAME_LENGTH = 14
@@ -345,6 +348,79 @@ function parseSerialProtocolPacket(packet) {
       kp: Number.parseFloat(fields.KP ?? ''),
       ki: Number.parseFloat(fields.KI ?? ''),
       kd: Number.parseFloat(fields.KD ?? '')
+    }
+  }
+
+  if (body.startsWith('CASCADE=')) {
+    const fields = parseKeyValueBody(body.slice(8))
+    return {
+      kind: 'cascade',
+      packet,
+      body,
+      hasChecksum,
+      kOuter: Number.parseFloat(fields.KO ?? ''),
+      maxRate: Number.parseFloat(fields.MR ?? ''),
+      kpInner: Number.parseFloat(fields.KPI ?? ''),
+      kiInner: Number.parseFloat(fields.KII ?? '')
+    }
+  }
+
+  if (body.startsWith('HYBRID=')) {
+    const fields = parseKeyValueBody(body.slice(7))
+    return {
+      kind: 'hybrid',
+      packet,
+      body,
+      hasChecksum,
+      threshold: Number.parseFloat(fields.TH ?? ''),
+      kp: Number.parseFloat(fields.KP ?? ''),
+      ki: Number.parseFloat(fields.KI ?? ''),
+      kd: Number.parseFloat(fields.KD ?? ''),
+      slowInterval: Number.parseInt(fields.INT ?? '0', 10) || 0
+    }
+  }
+
+  if (body.startsWith('NET=')) {
+    const fields = parseKeyValueBody(body.slice(4))
+    return {
+      kind: 'net',
+      packet,
+      body,
+      hasChecksum,
+      ip: fields.IP ?? '',
+      gateway: fields.GW ?? '',
+      netmask: fields.NM ?? '',
+      port: Number.parseInt(fields.PORT ?? '0', 10) || 0
+    }
+  }
+
+  if (body.startsWith('ETH=')) {
+    const fields = parseKeyValueBody(body.slice(4))
+    return {
+      kind: 'eth',
+      packet,
+      body,
+      hasChecksum,
+      link: Number.parseInt(fields.LINK ?? '0', 10) || 0,
+      phy: Number.parseInt(fields.PHY ?? '0', 10) || 0,
+      err: Number.parseInt(fields.ERR ?? '0', 10) || 0,
+      phyId: fields.PHYID ?? '',
+      rx: Number.parseInt(fields.RX ?? '0', 10) || 0,
+      tx: Number.parseInt(fields.TX ?? '0', 10) || 0,
+      arp: Number.parseInt(fields.ARP ?? '0', 10) || 0,
+      icmp: Number.parseInt(fields.ICMP ?? '0', 10) || 0,
+      aneg: Number.parseInt(fields.ANEG ?? '0', 10) || 0,
+      tcp: Number.parseInt(fields.TCP ?? '0', 10) || 0
+    }
+  }
+
+  if (body.startsWith('CONFIG=')) {
+    return {
+      kind: 'config',
+      packet,
+      body,
+      hasChecksum,
+      raw: body.slice(7)
     }
   }
 
@@ -684,15 +760,152 @@ function handleSerialChunk(chunk) {
   }
 }
 
+function broadcastTcpDebug(direction, summary, extra = {}) {
+  const payload = {
+    direction,
+    summary,
+    ...extra,
+    timestamp: Date.now()
+  }
+
+  console.log(`[tcp:${direction}] ${summary}`, extra)
+  broadcastToRenderers('device:tcp-debug', payload)
+}
+
+function broadcastTcpProtocol(message) {
+  if (!message) {
+    return
+  }
+
+  broadcastTcpDebug('rx', message.packet || message.body || '收到TCP协议消息', {
+    kind: message.kind,
+    packet: message.packet,
+    body: message.body,
+    status: message.status ?? null
+  })
+
+  broadcastToRenderers('device:tcp-protocol', {
+    ...message,
+    timestamp: Date.now()
+  })
+  settleTcpProtocolWaiters(message)
+}
+
+function settleTcpProtocolWaiters(message) {
+  for (const waiter of [...tcpProtocolWaiters]) {
+    if (waiter.kind && waiter.kind !== message.kind) {
+      continue
+    }
+
+    if (typeof waiter.match === 'function' && !waiter.match(message)) {
+      continue
+    }
+
+    clearTimeout(waiter.timer)
+    tcpProtocolWaiters.delete(waiter)
+    waiter.resolve(message)
+    return true
+  }
+
+  return false
+}
+
+function waitForTcpProtocolMessage({ kind, timeoutMs = 1500, match } = {}) {
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      kind,
+      match,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        tcpProtocolWaiters.delete(waiter)
+        reject(new Error('等待TCP设备回传超时'))
+      }, timeoutMs)
+    }
+
+    tcpProtocolWaiters.add(waiter)
+  })
+}
+
+function queueTcpCommand(task) {
+  const queued = tcpCommandChain.then(task, task)
+  tcpCommandChain = queued.catch(() => null)
+  return queued
+}
+
+function writeTcpPacket(packet) {
+  if (!tcpConnection || tcpConnection.destroyed) {
+    return Promise.reject(new Error('TCP未连接'))
+  }
+
+  const outboundPacket = `${packet.replace(/[\r\n]+$/g, '')}${SERIAL_PROTOCOL_COMMAND_TERMINATOR}`
+
+  return new Promise((resolve, reject) => {
+    tcpConnection.write(outboundPacket, 'ascii', (error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve()
+    })
+  })
+}
+
+function handleTcpData(chunk) {
+  if (!chunk || !chunk.length) {
+    return
+  }
+
+  tcpReceiveBuffer += chunk.toString('ascii')
+
+  while (true) {
+    const crlfIndex = tcpReceiveBuffer.indexOf('\r\n')
+    if (crlfIndex < 0) {
+      if (tcpReceiveBuffer.length > 2048) {
+        broadcastTcpDebug('rx', `TCP缓冲区溢出(${tcpReceiveBuffer.length}字节)，已清空`, { kind: 'overflow' })
+        tcpReceiveBuffer = ''
+      }
+      return
+    }
+
+    const line = tcpReceiveBuffer.slice(0, crlfIndex)
+    tcpReceiveBuffer = tcpReceiveBuffer.slice(crlfIndex + 2)
+
+    if (!line || !line.startsWith('!')) {
+      if (line.length > 1) {
+        broadcastTcpDebug('rx', `忽略非协议行: ${line.slice(0, 80)}`, { kind: 'ignored' })
+      }
+      continue
+    }
+
+    broadcastTcpDebug('rx', `原始TCP片段: ${line.slice(0, 120)}`, { kind: 'raw', packet: line })
+
+    const parsed = parseSerialProtocolPacket(line)
+    if (parsed) {
+      broadcastTcpProtocol(parsed)
+    } else {
+      broadcastTcpDebug('rx', `无法解析TCP协议: ${line.slice(0, 80)}`, { kind: 'malformed', packet: line })
+    }
+  }
+}
+
 function closeTcpConnection() {
   if (!tcpConnection) {
     tcpConnectionMeta = null
+    tcpReceiveBuffer = ''
     return
   }
 
   tcpConnection.destroy()
   tcpConnection = null
   tcpConnectionMeta = null
+  tcpReceiveBuffer = ''
+
+  for (const waiter of [...tcpProtocolWaiters]) {
+    clearTimeout(waiter.timer)
+    tcpProtocolWaiters.delete(waiter)
+    waiter.reject(new Error('TCP连接已断开'))
+  }
 }
 
 function getIpv4Interfaces() {
@@ -880,6 +1093,37 @@ ipcMain.handle('device:send-serial-command', async (_, options) => {
   })
 })
 
+ipcMain.handle('device:send-tcp-command', async (_, options) => {
+  const { body, expectKind = 'ack', timeoutMs = 1500 } = options || {}
+  if (!body) {
+    throw new Error('未提供TCP指令体')
+  }
+
+  if (!tcpConnection || tcpConnection.destroyed) {
+    throw new Error('TCP未连接')
+  }
+
+  return queueTcpCommand(async () => {
+    const packet = buildSerialProtocolPacket(body)
+    const responsePromise = expectKind
+      ? waitForTcpProtocolMessage({ kind: expectKind, timeoutMs })
+      : Promise.resolve(null)
+
+    await writeTcpPacket(packet)
+    broadcastTcpDebug('tx', `发送TCP指令: ${packet}`, { kind: 'command', packet })
+    const response = await responsePromise
+
+    if (response?.kind === 'ack' && response.status === 'ERR') {
+      throw new Error('设备返回 ACK=ERR')
+    }
+
+    return {
+      packet,
+      response
+    }
+  })
+})
+
 ipcMain.handle('device:get-network-interfaces', async () => {
   return getIpv4Interfaces()
 })
@@ -942,12 +1186,14 @@ ipcMain.handle('device:connect-network-device', async (_, options) => {
 
     socket.setTimeout(Number(timeoutMs))
     socket.once('connect', finishResolve)
+    socket.on('data', handleTcpData)
     socket.once('timeout', () => finishReject(new Error('网络连接超时')))
     socket.once('error', finishReject)
     socket.once('close', () => {
       if (tcpConnection === socket) {
         tcpConnection = null
         tcpConnectionMeta = null
+        tcpReceiveBuffer = ''
       }
     })
     socket.connect(Number(port), host)

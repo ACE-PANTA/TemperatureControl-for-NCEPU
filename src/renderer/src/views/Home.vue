@@ -100,6 +100,14 @@ const chartSvgRef = ref(null);
 const hoveredPointIndex = ref(-1);
 const draggedSeriesKey = ref('');
 const manualPwmDraft = ref('');
+const commandChannel = ref('serial');
+
+const commandChannelOptions = computed(() => {
+  const options = [];
+  if (serialConnected.value) options.push({ value: 'serial', label: '串口' });
+  if (ethernetConnected.value) options.push({ value: 'ethernet', label: '网口' });
+  return options;
+});
 
 const canResumeRecording = computed(() => recordingState.value.active && recordingState.value.paused);
 const canStartRecording = computed(() => !recordingState.value.active);
@@ -459,7 +467,7 @@ function handleTargetInput(event) {
 }
 
 async function handleTargetCommit() {
-  const committed = await simulationStore.commitTargetTemperature(targetTempDraft.value);
+  const committed = await simulationStore.commitTargetTemperature(targetTempDraft.value, commandChannel.value);
   if (committed) {
     targetTempDraft.value = Number(targetTempDraft.value).toFixed(1);
   }
@@ -480,7 +488,7 @@ function handleTargetBlur() {
 }
 
 async function handleManualPwmCommit() {
-  await simulationStore.applyManualPwm(manualPwmDraft.value);
+  await simulationStore.applyManualPwm(manualPwmDraft.value, commandChannel.value);
 }
 
 async function handleManualPwmKeydown(event) {
@@ -490,11 +498,11 @@ async function handleManualPwmKeydown(event) {
 }
 
 async function switchToAutoMode() {
-  await simulationStore.setControllerMode('AUTO');
+  await simulationStore.setControllerMode('AUTO', commandChannel.value);
 }
 
 async function switchToManualMode() {
-  await simulationStore.setControllerMode('MAN');
+  await simulationStore.setControllerMode('MAN', commandChannel.value);
 }
 
 async function toggleControllerMode() {
@@ -632,6 +640,11 @@ onMounted(async () => {
   await deviceStore.initializeCommunication();
   await simulationStore.ensureRunning();
   simulationStore.syncDraftToChannels();
+  if (serialConnected.value) {
+    commandChannel.value = 'serial';
+  } else if (ethernetConnected.value) {
+    commandChannel.value = 'ethernet';
+  }
 });
 </script>
 
@@ -642,7 +655,6 @@ onMounted(async () => {
         <div class="panel-heading hero-heading">
           <div>
             <h2>实时测温曲线</h2>
-            <p class="panel-intro">曲线区域保持最高优先级，目标温度可在下方直接修改，参考数据改为更紧凑的辅助信息。</p>
           </div>
           <div class="status-cluster">
             <span class="status-pill status-pill-live">实时采集中</span>
@@ -771,7 +783,7 @@ onMounted(async () => {
 
               <div v-if="!hasChartData" class="chart-empty-state">
                 <strong>暂无实时数据</strong>
-                <span>设备未上报测温数据时，曲线区域保持空白，不再显示任何预设样本。</span>
+                <span>设备未上报测温数据</span>
               </div>
 
               <div v-if="hoverTooltip" class="chart-tooltip" :style="{ left: `${hoverTooltip.leftPercent}%`, top: `${hoverTooltip.topPx}px` }">
@@ -796,8 +808,16 @@ onMounted(async () => {
         <div class="panel temperature-panel">
           <div class="temperature-layout">
             <div class="target-panel">
-              <p class="panel-kicker">TARGET CONTROL</p>
               <h3>控制下发</h3>
+              <div v-if="commandChannelOptions.length > 1" class="command-channel-row">
+                <span class="channel-label">下发通道</span>
+                <button
+                  v-for="opt in commandChannelOptions" :key="opt.value"
+                  type="button"
+                  :class="['channel-chip', { active: commandChannel === opt.value }]"
+                  @click="commandChannel = opt.value"
+                >{{ opt.label }}</button>
+              </div>
               <div class="control-mode-row">
                 <button type="button" :class="['action-button', 'mode-toggle-button', controlModeButtonClass]" @click="toggleControllerMode">{{ controlModeToggleLabel }}</button>
               </div>
@@ -850,14 +870,6 @@ onMounted(async () => {
                 <span>°C</span>
                 <button type="button" :class="['action-button', controlCommitButtonClass]" disabled>{{ controlCommitLabel }}</button>
               </div>
-
-              <p class="target-note">
-                {{ isAutoMode
-                  ? '自动模式下可设置目标温度，默认草稿为 40 °C，修改后需明确点击下发。'
-                  : isManualMode
-                    ? '手动模式下直接下发 PWM 输出，范围为 -100% 到 100%。'
-                    : '当前模式尚未同步，先点击上方按钮切换并等待状态刷新。' }}
-              </p>
               <div class="support-note-row control-meta-row">
                 <span>当前模式：{{ controllerModeLabel }}</span>
                 <span>当前 PWM：{{ currentPwmText }}</span>
@@ -890,9 +902,7 @@ onMounted(async () => {
       <div class="panel recording-panel">
         <div class="recording-head">
           <div>
-            <p class="panel-kicker">RECORDING CONTROL</p>
             <h2>录制控制</h2>
-            <p>录制控制固定放在连接面板上方，便于先操作会话，再处理链路。</p>
           </div>
           <span class="recording-badge">{{ recordingStatusText }}</span>
         </div>
@@ -914,7 +924,6 @@ onMounted(async () => {
       <div class="panel connect-panel">
         <div class="panel-heading compact">
           <div>
-            <p class="panel-kicker">COMMUNICATION BUS</p>
             <h2>设备连接</h2>
           </div>
         </div>
@@ -1063,7 +1072,6 @@ onMounted(async () => {
       <div class="panel event-panel">
         <div class="panel-heading compact">
           <div>
-            <p class="panel-kicker">SYSTEM EVENTS</p>
             <h2>系统状态</h2>
           </div>
         </div>
@@ -1497,6 +1505,36 @@ onMounted(async () => {
 .target-panel,
 .live-panel {
   flex: 1 1 16rem;
+}
+
+.command-channel-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.7rem;
+  flex-wrap: wrap;
+}
+.channel-label {
+  color: var(--tc-text-dim);
+  font-size: 0.76rem;
+  margin-right: 0.3rem;
+}
+.channel-chip {
+  padding: 0.38rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  border: 1px solid rgba(120, 149, 187, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--tc-text-secondary);
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+.channel-chip.active {
+  color: var(--tc-text-primary);
+  border-color: rgba(49, 221, 255, 0.35);
+  background: rgba(0, 137, 176, 0.26);
+  box-shadow: 0 0 8px rgba(0, 180, 255, 0.12);
 }
 
 .target-panel {

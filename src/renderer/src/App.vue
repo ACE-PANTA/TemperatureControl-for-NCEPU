@@ -13,10 +13,10 @@ const currentMeta = computed(() => {
     };
   }
 
-  if (route.name === 'pid') {
+  if (route.name === 'tuning') {
     return {
-      title: 'PID整定工作站',
-      subtitle: '参数整定 / 输出限制 / 控制策略'
+      title: '参数整定工作站',
+      subtitle: '级联控制 / 混合控制 / PID / 网络配置'
     };
   }
 
@@ -43,7 +43,7 @@ function exitApp() {
       <div class="shell-actions">
         <nav class="shell-nav">
           <router-link to="/" class="shell-link">监控主页</router-link>
-          <router-link to="/pid" class="shell-link">PID整定</router-link>
+          <router-link to="/tuning" class="shell-link">参数整定</router-link>
           <router-link to="/config" class="shell-link">系统配置</router-link>
         </nav>
         <button class="exit-button" @click="exitApp">退出系统</button>

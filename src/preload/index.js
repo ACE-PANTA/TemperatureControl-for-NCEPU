@@ -12,6 +12,7 @@ const deviceApi = {
     return () => ipcRenderer.removeListener('device:serial-frame', listener)
   },
   sendSerialCommand: (options) => ipcRenderer.invoke('device:send-serial-command', options),
+  sendTcpCommand: (options) => ipcRenderer.invoke('device:send-tcp-command', options),
   onSerialProtocol: (callback) => {
     const listener = (_, payload) => callback(payload)
     ipcRenderer.on('device:serial-protocol', listener)
@@ -21,6 +22,16 @@ const deviceApi = {
     const listener = (_, payload) => callback(payload)
     ipcRenderer.on('device:serial-debug', listener)
     return () => ipcRenderer.removeListener('device:serial-debug', listener)
+  },
+  onTcpProtocol: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('device:tcp-protocol', listener)
+    return () => ipcRenderer.removeListener('device:tcp-protocol', listener)
+  },
+  onTcpDebug: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('device:tcp-debug', listener)
+    return () => ipcRenderer.removeListener('device:tcp-debug', listener)
   },
   getNetworkInterfaces: () => ipcRenderer.invoke('device:get-network-interfaces'),
   scanNetworkDevices: (options) => ipcRenderer.invoke('device:scan-network-devices', options),

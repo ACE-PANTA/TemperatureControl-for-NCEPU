@@ -24,7 +24,6 @@ onMounted(async () => {
     <div class="panel config-panel">
       <div class="panel-heading">
         <div>
-          <p class="panel-kicker">SYSTEM CONFIGURATION</p>
           <h2>录制策略配置</h2>
           <p class="intro">这个页面只负责录制策略和日志目录。录制启停已经回到首页执行。</p>
         </div>
@@ -72,7 +71,6 @@ onMounted(async () => {
     <div class="panel side-panel">
       <div class="panel-heading compact">
         <div>
-          <p class="panel-kicker">RECORDING STATE</p>
           <h2>会话状态</h2>
         </div>
       </div>

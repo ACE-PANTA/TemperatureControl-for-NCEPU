@@ -2,7 +2,10 @@ import { computed, reactive, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import {
   defaultPidDraft,
-  normalizePidPayload
+  normalizePidPayload,
+  normalizeCascadePayload,
+  normalizeHybridPayload,
+  normalizeNetPayload
 } from '../services/pidSimulation.js';
 import { useDeviceRuntimeStore } from './deviceRuntime.js';
 import { useSystemConfigStore } from './systemConfig.js';
@@ -185,6 +188,35 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     lastMessageAt: null,
     busy: false
   });
+  const tcpProtocolState = reactive({
+    unsubscribe: null,
+    lastAck: null,
+    lastError: '',
+    lastMessageAt: null,
+    busy: false
+  });
+  const ethDiag = reactive({
+    link: 0,
+    phy: 0,
+    err: 0,
+    phyId: '',
+    rx: 0,
+    tx: 0,
+    arp: 0,
+    icmp: 0,
+    aneg: 0,
+    tcp: 0,
+    updatedAt: null
+  });
+  const ETH_ERR_LABELS = {
+    0: '正常',
+    1: 'PHY芯片无响应（检查焊接/供电/晶振）',
+    2: '网线未连接',
+    3: '自协商超时（RMII 50MHz时钟异常）',
+    4: 'ETH未初始化'
+  };
+  let ethernetPollTimer = null;
+  const ETHERNET_POLL_INTERVAL_MS = 1500;
   const controllerState = reactive({
     mode: null,
     pwm: null,
@@ -210,6 +242,9 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   });
 
   const pidDraft = computed(() => configStore.pidDraft);
+  const cascadeDraft = computed(() => configStore.cascadeDraft);
+  const hybridDraft = computed(() => configStore.hybridDraft);
+  const netDraft = computed(() => configStore.netDraft);
   const plantDraft = computed(() => configStore.plantDraft);
   const logDirectory = computed(() => configStore.settings.logDirectory);
   const visiblePointCount = computed(() => {
@@ -414,6 +449,207 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     if (payload.kind === 'pid') {
       applyQueriedPid(payload);
     }
+
+    if (payload.kind === 'cascade') {
+      Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
+        kOuter: payload.kOuter,
+        maxRate: payload.maxRate,
+        kpInner: payload.kpInner,
+        kiInner: payload.kiInner
+      }));
+    }
+
+    if (payload.kind === 'hybrid') {
+      Object.assign(configStore.hybridDraft, normalizeHybridPayload({
+        threshold: payload.threshold,
+        kp: payload.kp,
+        ki: payload.ki,
+        kd: payload.kd,
+        slowInterval: payload.slowInterval
+      }));
+    }
+
+    if (payload.kind === 'net') {
+      Object.assign(configStore.netDraft, normalizeNetPayload({
+        ip: payload.ip,
+        gateway: payload.gateway,
+        netmask: payload.netmask,
+        port: payload.port
+      }));
+    }
+
+    if (payload.kind === 'eth') {
+      applyEthDiag(payload);
+    }
+  }
+
+  function applyEthDiag(payload) {
+    ethDiag.link = Number.isFinite(payload.link) ? payload.link : 0;
+    ethDiag.phy = Number.isFinite(payload.phy) ? payload.phy : 0;
+    ethDiag.err = Number.isFinite(payload.err) ? payload.err : 0;
+    ethDiag.phyId = payload.phyId ?? '';
+    ethDiag.rx = Number.isFinite(payload.rx) ? payload.rx : 0;
+    ethDiag.tx = Number.isFinite(payload.tx) ? payload.tx : 0;
+    ethDiag.arp = Number.isFinite(payload.arp) ? payload.arp : 0;
+    ethDiag.icmp = Number.isFinite(payload.icmp) ? payload.icmp : 0;
+    ethDiag.aneg = Number.isFinite(payload.aneg) ? payload.aneg : 0;
+    ethDiag.tcp = Number.isFinite(payload.tcp) ? payload.tcp : 0;
+    ethDiag.updatedAt = Date.now();
+  }
+
+  function handleTcpProtocolMessage(payload) {
+    if (!payload) {
+      return;
+    }
+
+    console.log('[tcp-protocol]', payload);
+
+    tcpProtocolState.lastMessageAt = payload.timestamp || Date.now();
+
+    if (payload.kind === 'ack') {
+      tcpProtocolState.lastAck = payload.status;
+      if (payload.status === 'ERR') {
+        tcpProtocolState.lastError = '设备返回 ACK=ERR';
+      }
+      return;
+    }
+
+    if (payload.kind === 'state') {
+      const normalizedPayload = normalizeControllerSnapshot(payload);
+      applyControllerState(normalizedPayload);
+
+      // Feed ethernet STATE response into chart when ethernet is primary
+      if (deviceStore.primaryChannel === 'ethernet') {
+        ingestEthernetStateSample(normalizedPayload);
+      }
+      return;
+    }
+
+    if (payload.kind === 'pid') {
+      applyQueriedPid(payload);
+    }
+
+    if (payload.kind === 'cascade') {
+      Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
+        kOuter: payload.kOuter,
+        maxRate: payload.maxRate,
+        kpInner: payload.kpInner,
+        kiInner: payload.kiInner
+      }));
+    }
+
+    if (payload.kind === 'hybrid') {
+      Object.assign(configStore.hybridDraft, normalizeHybridPayload({
+        threshold: payload.threshold,
+        kp: payload.kp,
+        ki: payload.ki,
+        kd: payload.kd,
+        slowInterval: payload.slowInterval
+      }));
+    }
+
+    if (payload.kind === 'net') {
+      Object.assign(configStore.netDraft, normalizeNetPayload({
+        ip: payload.ip,
+        gateway: payload.gateway,
+        netmask: payload.netmask,
+        port: payload.port
+      }));
+    }
+
+    if (payload.kind === 'eth') {
+      applyEthDiag(payload);
+    }
+  }
+
+  function ingestEthernetStateSample(payload) {
+    if (!deviceStore.ethernetConnected) {
+      return;
+    }
+
+    const timestamp = Date.now();
+    const normalizedSetpoint = controllerState.goal ?? requestedSetpoint.value ?? 0;
+    const sample = {
+      channel: 'ethernet',
+      timestamp,
+      elapsedSeconds: Math.round((timestamp - (currentSamples.ethernet?.baselineTimestamp || timestamp)) / 1000),
+      sampleIndex: (currentSamples.ethernet?.sampleIndex || 0) + 1,
+      temperature: Number.isFinite(payload.feedback) ? payload.feedback : (currentSamples.ethernet?.temperature ?? 0),
+      setpoint: normalizedSetpoint,
+      requestedSetpoint: normalizedSetpoint,
+      controlOutput: Number.isFinite(payload.pwm) ? payload.pwm : (currentSamples.ethernet?.controlOutput ?? 0),
+      disturbance: Number(currentSamples.ethernet?.disturbance || 0),
+      overshootPercent: Number(currentSamples.ethernet?.overshootPercent || 0),
+      settlingTime: currentSamples.ethernet?.settlingTime ?? null,
+      mode: payload.mode || controllerState.mode || 'ethernet-live',
+      kp: Number(lastAppliedPid.value.kp),
+      ki: Number(lastAppliedPid.value.ki),
+      kd: Number(lastAppliedPid.value.kd),
+      sampleTime: 1,
+      outputLimit: 100,
+      deadband: 0,
+      setpointRamp: 0,
+      xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
+      boardTemperature: 0,
+      telemetry: [],
+      baselineTimestamp: currentSamples.ethernet?.baselineTimestamp || timestamp
+    };
+
+    currentSamples.ethernet = sample;
+    controllerState.feedback = sample.temperature;
+    controllerState.pwm = sample.controlOutput;
+    queueRecordedSample('ethernet', sample);
+
+    if (deviceStore.primaryChannel === 'ethernet') {
+      const series = [
+        createSeriesEntry({ key: 'furnaceTemp', value: sample.temperature }),
+        createSeriesEntry({ key: 'pwm', value: sample.controlOutput })
+      ];
+      appendCurveSample(createCurveSample({
+        elapsedSeconds: sample.elapsedSeconds,
+        timestamp,
+        channel: 'ethernet',
+        temperature: sample.temperature,
+        requestedSetpoint: normalizedSetpoint,
+        series
+      }));
+    }
+  }
+
+  function startEthernetPolling() {
+    stopEthernetPolling();
+    ethernetPollTimer = window.setInterval(async () => {
+      if (!deviceStore.ethernetConnected || deviceStore.primaryChannel !== 'ethernet') {
+        return;
+      }
+      try {
+        await refreshControllerState({ silent: true, channel: 'ethernet' });
+      } catch {
+        // silently ignore polling failures
+      }
+    }, ETHERNET_POLL_INTERVAL_MS);
+  }
+
+  function stopEthernetPolling() {
+    if (ethernetPollTimer) {
+      window.clearInterval(ethernetPollTimer);
+      ethernetPollTimer = null;
+    }
+  }
+
+  function attachTcpProtocolListener() {
+    if (!deviceApi?.onTcpProtocol || tcpProtocolState.unsubscribe) {
+      return;
+    }
+
+    tcpProtocolState.unsubscribe = deviceApi.onTcpProtocol((payload) => {
+      handleTcpProtocolMessage(payload);
+    });
+  }
+
+  function detachTcpProtocolListener() {
+    tcpProtocolState.unsubscribe?.();
+    tcpProtocolState.unsubscribe = null;
   }
 
   function attachSerialProtocolListener() {
@@ -431,45 +667,69 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     serialProtocolState.unsubscribe = null;
   }
 
-  function ensureSerialControlAvailable(actionText) {
+  function resolveChannel(channel) {
+    return channel || deviceStore.primaryChannel || 'serial';
+  }
+
+  function ensureChannelAvailable(channel, actionText) {
+    if (channel === 'ethernet') {
+      if (!deviceApi?.sendTcpCommand) {
+        throw new Error('当前环境未提供TCP控制能力');
+      }
+      if (!deviceStore.ethernetConnected) {
+        throw new Error(`请先连接网口，再执行${actionText}`);
+      }
+      return;
+    }
+
     if (!deviceApi?.sendSerialCommand) {
       throw new Error('当前环境未提供真实串口控制能力');
     }
-
     if (!deviceStore.serialConnected) {
       throw new Error(`请先连接串口，再执行${actionText}`);
     }
   }
 
-  async function sendSerialProtocolCommand(body, expectKind = 'ack', actionText = '串口控制') {
-    ensureSerialControlAvailable(actionText);
-    serialProtocolState.busy = true;
-    serialProtocolState.lastError = '';
+  async function sendChannelCommand(body, expectKind = 'ack', actionText = '指令下发', channel = null) {
+    const targetChannel = resolveChannel(channel);
+    ensureChannelAvailable(targetChannel, actionText);
+
+    const isEthernet = targetChannel === 'ethernet';
+    const protocolState = isEthernet ? tcpProtocolState : serialProtocolState;
+    const sendApi = isEthernet ? deviceApi.sendTcpCommand : deviceApi.sendSerialCommand;
+
+    protocolState.busy = true;
+    protocolState.lastError = '';
 
     try {
-      const result = await deviceApi.sendSerialCommand({
+      const result = await sendApi({
         body,
         expectKind,
         timeoutMs: expectKind === 'ack' ? 1600 : 1800
       });
 
       if (result?.response) {
-        handleSerialProtocolMessage(result.response);
+        if (isEthernet) {
+          handleTcpProtocolMessage(result.response);
+        } else {
+          handleSerialProtocolMessage(result.response);
+        }
       }
 
-      deviceStore.appendEvent(`已发送串口指令：${body}`);
+      const channelLabel = isEthernet ? '网口' : '串口';
+      deviceStore.appendEvent(`已发送${channelLabel}指令：${body}`);
       return result?.response || null;
     } catch (error) {
-      serialProtocolState.lastError = error.message || '未知错误';
+      protocolState.lastError = error.message || '未知错误';
       throw error;
     } finally {
-      serialProtocolState.busy = false;
+      protocolState.busy = false;
     }
   }
 
-  async function refreshControllerState({ silent = false } = {}) {
+  async function refreshControllerState({ silent = false, channel = null } = {}) {
     try {
-      const response = await sendSerialProtocolCommand('GET=STATE', 'state', '状态查询');
+      const response = await sendChannelCommand('GET=STATE', 'state', '状态查询', channel);
       console.log('[refresh-controller-state:response]', response);
       console.log('[refresh-controller-state:normalized]', normalizeControllerSnapshot(response));
       if (!silent) {
@@ -489,9 +749,9 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function refreshPidParameters({ silent = false } = {}) {
+  async function refreshPidParameters({ silent = false, channel = null } = {}) {
     try {
-      const response = await sendSerialProtocolCommand('GET=PID', 'pid', 'PID 查询');
+      const response = await sendChannelCommand('GET=PID', 'pid', 'PID 查询', channel);
       if (!silent) {
         deviceStore.pushAlert({
           tone: 'success',
@@ -505,6 +765,115 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
         deviceStore.pushAlert({ tone: 'danger', title: 'PID 查询失败', message: error.message || '未知错误' });
       }
       deviceStore.appendEvent(`PID 查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshCascadeParams({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=CASCADE', 'cascade', '级联参数查询', channel);
+      if (response?.kind === 'cascade') {
+        Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
+          kOuter: response.kOuter,
+          maxRate: response.maxRate,
+          kpInner: response.kpInner,
+          kiInner: response.kiInner
+        }));
+      }
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: '级联参数已同步',
+          message: '已读取设备内当前级联控制器参数。'
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '级联参数查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`级联参数查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshHybridParams({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=HYBRID', 'hybrid', '混合参数查询', channel);
+      if (response?.kind === 'hybrid') {
+        Object.assign(configStore.hybridDraft, normalizeHybridPayload({
+          threshold: response.threshold,
+          kp: response.kp,
+          ki: response.ki,
+          kd: response.kd,
+          slowInterval: response.slowInterval
+        }));
+      }
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: '混合参数已同步',
+          message: '已读取设备内当前混合控制器参数。'
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '混合参数查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`混合参数查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshNetConfig({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=NET', 'net', '网络配置查询', channel);
+      if (response?.kind === 'net') {
+        Object.assign(configStore.netDraft, normalizeNetPayload({
+          ip: response.ip,
+          gateway: response.gateway,
+          netmask: response.netmask,
+          port: response.port
+        }));
+      }
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: '网络配置已同步',
+          message: '已读取设备内当前网络配置参数。'
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '网络配置查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`网络配置查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshEthDiag({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=ETH', 'eth', 'ETH诊断查询', channel);
+      if (response?.kind === 'eth') {
+        applyEthDiag(response);
+      }
+      if (!silent) {
+        const errLabel = ETH_ERR_LABELS[ethDiag.err] || '未知';
+        deviceStore.pushAlert({
+          tone: ethDiag.err === 0 ? 'success' : 'warning',
+          title: 'ETH诊断已更新',
+          message: `LINK=${ethDiag.link} TCP=${ethDiag.tcp} ERR=${ethDiag.err} (${errLabel})`
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: 'ETH诊断查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`ETH诊断查询失败：${error.message}`);
       return null;
     }
   }
@@ -525,14 +894,14 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }, delayMs);
   }
 
-  async function setControllerMode(mode) {
+  async function setControllerMode(mode, channel = null) {
     const normalizedMode = String(mode || '').toUpperCase();
     if (!['AUTO', 'MAN'].includes(normalizedMode)) {
       return false;
     }
 
     try {
-      await sendSerialProtocolCommand(`MODE=${normalizedMode}`, 'ack', '模式切换');
+      await sendChannelCommand(`MODE=${normalizedMode}`, 'ack', '模式切换', channel);
       applyControllerState({ mode: normalizedMode });
       scheduleControllerStateRefresh();
       deviceStore.pushAlert({
@@ -548,7 +917,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function applyManualPwm(value) {
+  async function applyManualPwm(value, channel = null) {
     const normalizedPwm = Math.max(-100, Math.min(100, Math.round(Number(value))));
     if (!Number.isFinite(normalizedPwm)) {
       deviceStore.pushAlert({ tone: 'warning', title: 'PWM 未下发', message: '请输入有效的 PWM 数值。' });
@@ -556,7 +925,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
 
     try {
-      await sendSerialProtocolCommand(`PWM=${normalizedPwm}`, 'ack', 'PWM 下发');
+      await sendChannelCommand(`PWM=${normalizedPwm}`, 'ack', 'PWM 下发', channel);
       applyControllerState({ pwm: normalizedPwm });
       scheduleControllerStateRefresh();
       deviceStore.pushAlert({
@@ -884,21 +1253,27 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     resizeCurve();
     attachSerialFrameListener();
     attachSerialProtocolListener();
+    attachTcpProtocolListener();
     await ensureLogDirectory();
     await reconcileRecordingLifecycle();
     if (deviceStore.serialConnected) {
       await refreshControllerSnapshot({ silent: true });
     }
+    if (deviceStore.ethernetConnected && deviceStore.primaryChannel === 'ethernet') {
+      startEthernetPolling();
+    }
   }
 
   async function stopRuntime() {
     runtimeStarted.value = false;
+    stopEthernetPolling();
     if (controllerRefreshTimer) {
       window.clearTimeout(controllerRefreshTimer);
       controllerRefreshTimer = null;
     }
     detachSerialFrameListener();
     detachSerialProtocolListener();
+    detachTcpProtocolListener();
     await Promise.all([flushChannelBatch('serial'), flushChannelBatch('ethernet')]);
   }
 
@@ -953,7 +1328,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function commitTargetTemperature(value = requestedSetpoint.value) {
+  async function commitTargetTemperature(value = requestedSetpoint.value, channel = null) {
     if (value === '' || value === null || value === undefined) {
       deviceStore.pushAlert({ tone: 'warning', title: '目标温度未下发', message: '请输入有效的目标温度。' });
       return false;
@@ -967,7 +1342,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
     const clampedTarget = Math.min(1200, Math.max(0, normalizedTarget));
     try {
-      await sendSerialProtocolCommand(`TEMP=${clampedTarget.toFixed(1)}`, 'ack', '目标温度下发');
+      await sendChannelCommand(`TEMP=${clampedTarget.toFixed(1)}`, 'ack', '目标温度下发', channel);
       applyControllerState({ goal: clampedTarget });
       scheduleControllerStateRefresh();
       deviceStore.pushAlert({
@@ -983,38 +1358,167 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function dispatchPidParameters() {
+  async function dispatchPidParameters(channel = null) {
+    const targetChannel = resolveChannel(channel);
     const normalizedPid = normalizePidPayload(configStore.pidDraft);
     Object.assign(configStore.pidDraft, normalizedPid);
 
     try {
-      await sendSerialProtocolCommand(
-        `PID=${normalizedPid.kp.toFixed(3)},${normalizedPid.ki.toFixed(3)},${normalizedPid.kd.toFixed(3)}`,
+      await sendChannelCommand(
+        `PID=${normalizedPid.kp.toFixed(4)},${normalizedPid.ki.toFixed(4)},${normalizedPid.kd.toFixed(4)}`,
         'ack',
-        'PID 参数下发'
+        'PID 参数下发',
+        targetChannel
       );
 
       previousAppliedPid.value = { ...lastAppliedPid.value };
       lastAppliedPid.value = { ...normalizedPid };
       latestPidDispatch.value = {
-        channel: 'serial',
+        channel: targetChannel,
         timestamp: Date.now(),
         payload: { ...normalizedPid }
       };
-      await refreshPidParameters({ silent: true });
+      await refreshPidParameters({ silent: true, channel: targetChannel });
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
       deviceStore.appendEvent(
-        `PID 参数已下发到串口控制器：Kp ${normalizedPid.kp.toFixed(3)} / Ki ${normalizedPid.ki.toFixed(3)} / Kd ${normalizedPid.kd.toFixed(3)}`
+        `PID 参数已下发到${channelLabel}控制器：Kp ${normalizedPid.kp.toFixed(4)} / Ki ${normalizedPid.ki.toFixed(4)} / Kd ${normalizedPid.kd.toFixed(4)}`
       );
       deviceStore.pushAlert({
         tone: 'success',
         title: 'PID 参数更新成功',
-        message: '已更新串口控制器 PID 参数。'
+        message: `已更新${channelLabel}控制器 PID 参数。`
       });
-      return { applied: true, channel: 'serial' };
+      return { applied: true, channel: targetChannel };
     } catch (error) {
       deviceStore.pushAlert({ tone: 'danger', title: 'PID 参数下发失败', message: error.message || '未知错误' });
       deviceStore.appendEvent(`PID 参数下发失败：${error.message}`);
       return { applied: false };
+    }
+  }
+
+  async function dispatchCascadeParams(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const normalized = normalizeCascadePayload(configStore.cascadeDraft);
+    Object.assign(configStore.cascadeDraft, normalized);
+
+    try {
+      await sendChannelCommand(
+        `CASCADE=${normalized.kOuter.toFixed(2)},${normalized.maxRate.toFixed(2)},${normalized.kpInner.toFixed(2)},${normalized.kiInner.toFixed(2)}`,
+        'ack',
+        '级联参数下发',
+        targetChannel
+      );
+
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(
+        `级联参数已下发到${channelLabel}控制器：K_outer ${normalized.kOuter} / MaxRate ${normalized.maxRate} / Kp_inner ${normalized.kpInner} / Ki_inner ${normalized.kiInner}`
+      );
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '级联参数已下发',
+        message: `已更新${channelLabel}控制器级联参数。`
+      });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '级联参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`级联参数下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchHybridParams(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const normalized = normalizeHybridPayload(configStore.hybridDraft);
+    Object.assign(configStore.hybridDraft, normalized);
+
+    try {
+      await sendChannelCommand(
+        `HYBRID=${normalized.threshold.toFixed(2)},${normalized.kp.toFixed(2)},${normalized.ki.toFixed(3)},${normalized.kd.toFixed(2)},${normalized.slowInterval}`,
+        'ack',
+        '混合参数下发',
+        targetChannel
+      );
+
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(
+        `混合参数已下发到${channelLabel}控制器：TH ${normalized.threshold} / Kp ${normalized.kp} / Ki ${normalized.ki} / Kd ${normalized.kd} / 慢速间隔 ${normalized.slowInterval}s`
+      );
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '混合参数已下发',
+        message: `已更新${channelLabel}控制器混合参数。`
+      });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '混合参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`混合参数下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchNetConfig(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const normalized = normalizeNetPayload(configStore.netDraft);
+    Object.assign(configStore.netDraft, normalized);
+
+    try {
+      await sendChannelCommand(
+        `NET=${normalized.ip},${normalized.gateway},${normalized.netmask},${normalized.port}`,
+        'ack',
+        '网络配置下发',
+        targetChannel
+      );
+
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(
+        `网络配置已下发到${channelLabel}：IP ${normalized.ip} / GW ${normalized.gateway} / NM ${normalized.netmask} / Port ${normalized.port}`
+      );
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '网络配置已下发',
+        message: `已更新设备网络配置（重启后生效）。`
+      });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '网络配置下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`网络配置下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchSaveConfig(channel = null) {
+    try {
+      await sendChannelCommand('SAVE', 'ack', '保存配置', channel);
+      const channelLabel = (channel || deviceStore.primaryChannel) === 'ethernet' ? '网口' : '串口';
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '配置已保存',
+        message: `已通过${channelLabel}保存当前配置到设备 Flash。`
+      });
+      deviceStore.appendEvent('配置已保存到设备 Flash');
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '保存配置失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`保存配置失败：${error.message}`);
+      return false;
+    }
+  }
+
+  async function dispatchResetConfig(channel = null) {
+    try {
+      await sendChannelCommand('RESET', 'ack', '恢复出厂设置', channel);
+      const channelLabel = (channel || deviceStore.primaryChannel) === 'ethernet' ? '网口' : '串口';
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '已恢复出厂设置',
+        message: `已通过${channelLabel}恢复设备出厂默认配置（MAC地址保留）。`
+      });
+      deviceStore.appendEvent('设备配置已恢复出厂默认值');
+      return true;
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '恢复出厂设置失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`恢复出厂设置失败：${error.message}`);
+      return false;
     }
   }
 
@@ -1052,15 +1556,38 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
   watch(
     () => deviceStore.ethernetConnected,
-    (connected) => {
+    (connected, wasConnected) => {
       if (connected) {
+        attachTcpProtocolListener();
+        if (deviceStore.primaryChannel === 'ethernet') {
+          startEthernetPolling();
+        }
         return;
       }
 
+      stopEthernetPolling();
       currentSamples.ethernet = null;
       if (deviceStore.primaryChannel !== 'serial') {
         curveHistory.value = [];
         chartPanOffset.value = 0;
+      }
+    }
+  );
+
+  watch(
+    () => deviceStore.primaryChannel,
+    (channel, previousChannel) => {
+      // Handle ethernet polling for chart data
+      if (channel === 'ethernet' && deviceStore.ethernetConnected) {
+        startEthernetPolling();
+      } else {
+        stopEthernetPolling();
+      }
+
+      // Clear chart on channel switch
+      if (channel && channel !== previousChannel) {
+        chartPanOffset.value = 0;
+        curveHistory.value = [];
       }
     }
   );
@@ -1073,21 +1600,10 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       if (!hasActiveConnection()) {
         curveHistory.value = [];
         chartPanOffset.value = 0;
+        stopEthernetPolling();
       }
     },
     { immediate: true }
-  );
-
-  watch(
-    () => deviceStore.primaryChannel,
-    (channel, previousChannel) => {
-      if (!channel || channel === previousChannel) {
-        return;
-      }
-
-      chartPanOffset.value = 0;
-      curveHistory.value = [];
-    }
   );
 
   return {
@@ -1129,12 +1645,28 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     applyProfile,
     resetPidDraft,
     syncDraftToChannels,
+    cascadeDraft,
+    hybridDraft,
+    netDraft,
+    serialProtocolState,
+    tcpProtocolState,
     refreshControllerState,
     refreshPidParameters,
+    refreshCascadeParams,
+    refreshHybridParams,
+    refreshNetConfig,
     refreshControllerSnapshot,
     setControllerMode,
     applyManualPwm,
     dispatchPidParameters,
+    dispatchCascadeParams,
+    dispatchHybridParams,
+    dispatchNetConfig,
+    dispatchSaveConfig,
+    dispatchResetConfig,
+    ethDiag,
+    ETH_ERR_LABELS,
+    refreshEthDiag,
     applyPlantDraft,
     setTargetTemperature,
     commitTargetTemperature

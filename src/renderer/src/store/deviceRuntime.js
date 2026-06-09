@@ -313,6 +313,26 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
     appendEvent('网口连接已断开');
   }
 
+  const tcpProtocolEnabled = ref(false);
+
+  function enableTcpProtocolListener() {
+    if (!deviceApi?.onTcpProtocol || tcpProtocolEnabled.value) {
+      return;
+    }
+
+    tcpProtocolEnabled.value = true;
+
+    deviceApi.onTcpProtocol((payload) => {
+      console.log('[tcp-protocol]', payload);
+    });
+
+    if (deviceApi?.onTcpDebug) {
+      deviceApi.onTcpDebug((payload) => {
+        console.log('[tcp-debug]', payload);
+      });
+    }
+  }
+
   async function initializeCommunication() {
     if (initialized.value) {
       return;
@@ -326,6 +346,7 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
       });
     }
 
+    enableTcpProtocolListener();
     await loadNetworkAdapters();
     await Promise.all([searchSerialPorts(), searchEthernetDevices()]);
   }

@@ -1,8 +1,8 @@
 import { createRouter, createWebHashHistory } from 'vue-router';
 import Home from '../views/Home.vue';
-import PidTuning from '../views/PidTuning.vue';
+import ParamTuning from '../views/ParamTuning.vue';
 import SystemConfig from '../views/SystemConfig.vue';
- 
+
 const routes = [
   {
     path: '/',
@@ -10,9 +10,9 @@ const routes = [
     component: Home,
   },
   {
-    path: '/pid',
-    name: 'pid',
-    component: PidTuning,
+    path: '/tuning',
+    name: 'tuning',
+    component: ParamTuning,
   },
   {
     path: '/config',

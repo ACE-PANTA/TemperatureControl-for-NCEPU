@@ -1,27 +1,7 @@
 export const defaultPidDraft = {
-  kp: 1.1546,
-  ki: 0.0054,
-  kd: 0.0,
-  outputLimit: 85,
-  sampleTime: 1000,
-  deadband: 1.2,
-  setpointRamp: 18,
-  mode: '自动'
-};
-
-export const defaultCascadeDraft = {
-  kOuter: 0.5,
-  maxRate: 3.0,
-  kpInner: 40.0,
-  kiInner: 12.0
-};
-
-export const defaultHybridDraft = {
-  threshold: 5.0,
   kp: 3.0,
   ki: 0.3,
-  kd: 1.0,
-  slowInterval: 15
+  kd: 1.0
 };
 
 export const defaultNetDraft = {
@@ -55,31 +35,7 @@ export function normalizePidPayload(payload = {}) {
   return {
     kp: Number(payload.kp ?? defaultPidDraft.kp),
     ki: Number(payload.ki ?? defaultPidDraft.ki),
-    kd: Number(payload.kd ?? defaultPidDraft.kd),
-    outputLimit: Number(payload.outputLimit ?? defaultPidDraft.outputLimit),
-    sampleTime: Number(payload.sampleTime ?? defaultPidDraft.sampleTime),
-    deadband: Number(payload.deadband ?? defaultPidDraft.deadband),
-    setpointRamp: Number(payload.setpointRamp ?? defaultPidDraft.setpointRamp),
-    mode: payload.mode ?? defaultPidDraft.mode
-  };
-}
-
-export function normalizeCascadePayload(payload = {}) {
-  return {
-    kOuter: Number(payload.kOuter ?? defaultCascadeDraft.kOuter),
-    maxRate: Number(payload.maxRate ?? defaultCascadeDraft.maxRate),
-    kpInner: Number(payload.kpInner ?? defaultCascadeDraft.kpInner),
-    kiInner: Number(payload.kiInner ?? defaultCascadeDraft.kiInner)
-  };
-}
-
-export function normalizeHybridPayload(payload = {}) {
-  return {
-    threshold: Number(payload.threshold ?? defaultHybridDraft.threshold),
-    kp: Number(payload.kp ?? defaultHybridDraft.kp),
-    ki: Number(payload.ki ?? defaultHybridDraft.ki),
-    kd: Number(payload.kd ?? defaultHybridDraft.kd),
-    slowInterval: Number(payload.slowInterval ?? defaultHybridDraft.slowInterval)
+    kd: Number(payload.kd ?? defaultPidDraft.kd)
   };
 }
 

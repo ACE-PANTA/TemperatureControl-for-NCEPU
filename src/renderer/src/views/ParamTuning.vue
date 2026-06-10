@@ -18,8 +18,6 @@ const {
 
 const {
   pidDraft,
-  cascadeDraft,
-  hybridDraft,
   netDraft,
   controllerState,
   currentTemp,
@@ -85,20 +83,6 @@ async function queryPid() {
 }
 async function dispatchPid() {
   await simulationStore.dispatchPidParameters(dispatchChannel.value);
-}
-
-async function queryCascade() {
-  await simulationStore.refreshCascadeParams({ channel: dispatchChannel.value });
-}
-async function dispatchCascade() {
-  await simulationStore.dispatchCascadeParams(dispatchChannel.value);
-}
-
-async function queryHybrid() {
-  await simulationStore.refreshHybridParams({ channel: dispatchChannel.value });
-}
-async function dispatchHybrid() {
-  await simulationStore.dispatchHybridParams(dispatchChannel.value);
 }
 
 async function queryNet() {
@@ -209,90 +193,11 @@ onMounted(async () => {
           </div>
         </div>
 
-        <!-- Cascade Controller -->
+        <!-- PID Parameters -->
         <div class="param-card">
           <div class="card-head">
-            <h3>&#128208; 串级控制器 (远区)</h3>
-            <span class="card-desc">|error| &gt; 阈值时激活，外环温度→速率，内环速率→PWM</span>
-            <div class="card-actions">
-              <button class="btn-query" :disabled="!hasActiveChannel || isChannelBusy" @click="queryCascade">查询</button>
-              <button class="btn-dispatch" :disabled="!hasActiveChannel || isChannelBusy" @click="dispatchCascade">下发</button>
-            </div>
-          </div>
-          <div class="card-body param-grid">
-            <div class="param-item">
-              <label>外环增益 K_outer</label>
-              <input v-model.number="cascadeDraft.kOuter" type="number" min="0.01" max="10" step="0.01" />
-              <span class="param-range">0.01 ~ 10</span>
-            </div>
-            <div class="param-item">
-              <label>最大升温速率 (°C/s)</label>
-              <input v-model.number="cascadeDraft.maxRate" type="number" min="0.1" max="20" step="0.1" />
-              <span class="param-range">0.1 ~ 20</span>
-            </div>
-            <div class="param-item">
-              <label>内环比例 Kp_inner</label>
-              <input v-model.number="cascadeDraft.kpInner" type="number" min="1" max="200" step="0.1" />
-              <span class="param-range">1 ~ 200</span>
-            </div>
-            <div class="param-item">
-              <label>内环积分 Ki_inner</label>
-              <input v-model.number="cascadeDraft.kiInner" type="number" min="0" max="100" step="0.1" />
-              <span class="param-range">0 ~ 100</span>
-            </div>
-          </div>
-          <div class="card-values">
-            <span>KO={{ fmt(cascadeDraft.kOuter, 2) }} | MR={{ fmt(cascadeDraft.maxRate, 1) }} | KPI={{ fmt(cascadeDraft.kpInner, 1) }} | KII={{ fmt(cascadeDraft.kiInner, 1) }}</span>
-          </div>
-        </div>
-
-        <!-- Hybrid Controller (分层增量PID) -->
-        <div class="param-card">
-          <div class="card-head">
-            <h3>&#127919; 分层增量PID (近区)</h3>
-            <span class="card-desc">|error| ≤ 阈值时激活。2~5°C每秒PID，0.5~2°C慢速PID，≤0.5°C死区</span>
-            <div class="card-actions">
-              <button class="btn-query" :disabled="!hasActiveChannel || isChannelBusy" @click="queryHybrid">查询</button>
-              <button class="btn-dispatch" :disabled="!hasActiveChannel || isChannelBusy" @click="dispatchHybrid">下发</button>
-            </div>
-          </div>
-          <div class="card-body param-grid">
-            <div class="param-item">
-              <label>切换阈值 (°C)</label>
-              <input v-model.number="hybridDraft.threshold" type="number" min="0.5" max="20" step="0.1" />
-              <span class="param-range">0.5 ~ 20</span>
-            </div>
-            <div class="param-item">
-              <label>增量 Kp (趋势增益)</label>
-              <input v-model.number="hybridDraft.kp" type="number" min="0.1" max="50" step="0.1" />
-              <span class="param-range">0.1 ~ 50</span>
-            </div>
-            <div class="param-item">
-              <label>增量 Ki (持续驱动)</label>
-              <input v-model.number="hybridDraft.ki" type="number" min="0" max="5" step="0.001" />
-              <span class="param-range">0 ~ 5</span>
-            </div>
-            <div class="param-item">
-              <label>微分 Kd (阻尼防过冲)</label>
-              <input v-model.number="hybridDraft.kd" type="number" min="0" max="10" step="0.1" />
-              <span class="param-range">0 ~ 10</span>
-            </div>
-            <div class="param-item param-item-wide">
-              <label>慢速区间隔 (秒)</label>
-              <input v-model.number="hybridDraft.slowInterval" type="number" min="3" max="60" step="1" />
-              <span class="param-range">3 ~ 60 (默认15s)</span>
-            </div>
-          </div>
-          <div class="card-values">
-            <span>TH={{ fmt(hybridDraft.threshold, 1) }} | Kp={{ fmt(hybridDraft.kp, 2) }} | Ki={{ fmt(hybridDraft.ki, 3) }} | Kd={{ fmt(hybridDraft.kd, 2) }} | 慢速间隔={{ hybridDraft.slowInterval || 15 }}s</span>
-          </div>
-        </div>
-
-        <!-- Traditional PID -->
-        <div class="param-card">
-          <div class="card-head">
-            <h3>&#128202; 传统 PID (保留/兼容)</h3>
-            <span class="card-desc">通用 PID 参数，兼容旧版控制方案</span>
+            <h3>&#128202; 增量式 PID 参数</h3>
+            <span class="card-desc">增量式 PID + 死区补偿，适配大滞后热力系统</span>
             <div class="card-actions">
               <button class="btn-query" :disabled="!hasActiveChannel || isChannelBusy" @click="queryPid">查询</button>
               <button class="btn-dispatch" :disabled="!hasActiveChannel || isChannelBusy" @click="dispatchPid">下发</button>
@@ -431,10 +336,10 @@ onMounted(async () => {
         <!-- Tuning Guide -->
         <div class="tuning-note">
           <h3>调参指南</h3>
-          <p>1. 远区（串级）：升温太慢 → 增大 max_heat_rate；过冲 → 减小 k_outer</p>
-          <p>2. 近区 2~5°C：偏差不消 → 增大 hyb_ki (0.3→0.6)；小幅振荡 → 减小 hyb_kp (3→1.5)</p>
-          <p>3. 近区 0.5~2°C：PWM跳太快 → 增大 slow_interval (15→25)；PWM变化太大 → 改慢速区限幅(需重编译)</p>
-          <p>4. 防过冲振荡：温度过冲 → 增大 hyb_kd (1→3)；PWM大振荡(0←→100) → 收紧d_down + 增大hyb_kd</p>
+          <p>1. 设定死区时间：PID 整定间隔需 ≥ 系统纯滞后时间。升温慢的大热容系统先用 PID=3.0,0.3,1.0,10</p>
+          <p>2. 升温太慢 → 增大 Kp (3→5)；温度过冲 → 增大 Kd (1→3)；稳态偏差不消 → 增大 Ki (0.3→0.6)</p>
+          <p>3. PWM 大幅振荡(0↔100) → 减小 pid_max_delta (8→4) 或增大整定间隔 (5→10)</p>
+          <p>4. 目标附近小幅振荡 → 增大 pid_deadband (0.3→0.5)；偏差稳定在 0.5°C 附近 → 减小死区 (0.3→0.1)</p>
           <p>5. 修改网络配置后需重启设备；调参完成后务必执行「保存到 Flash」以免断电丢失</p>
         </div>
       </div>
@@ -450,8 +355,6 @@ onMounted(async () => {
         <div class="action-row compact-actions">
           <button class="btn-side" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryState">查询状态</button>
           <button class="btn-side" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryPid">查询 PID</button>
-          <button class="btn-side" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryCascade">查询级联</button>
-          <button class="btn-side" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryHybrid">查询混合</button>
           <button class="btn-side btn-side-full" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryNet">查询网络</button>
           <button class="btn-side btn-side-full btn-eth" type="button" :disabled="!hasActiveChannel || isChannelBusy" @click="queryEth">诊断 ETH</button>
         </div>

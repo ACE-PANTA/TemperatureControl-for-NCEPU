@@ -3,8 +3,6 @@ import { defineStore } from 'pinia';
 import {
   defaultPidDraft,
   normalizePidPayload,
-  normalizeCascadePayload,
-  normalizeHybridPayload,
   normalizeNetPayload
 } from '../services/pidSimulation.js';
 import { useDeviceRuntimeStore } from './deviceRuntime.js';
@@ -242,8 +240,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   });
 
   const pidDraft = computed(() => configStore.pidDraft);
-  const cascadeDraft = computed(() => configStore.cascadeDraft);
-  const hybridDraft = computed(() => configStore.hybridDraft);
   const netDraft = computed(() => configStore.netDraft);
   const plantDraft = computed(() => configStore.plantDraft);
   const logDirectory = computed(() => configStore.settings.logDirectory);
@@ -450,25 +446,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       applyQueriedPid(payload);
     }
 
-    if (payload.kind === 'cascade') {
-      Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
-        kOuter: payload.kOuter,
-        maxRate: payload.maxRate,
-        kpInner: payload.kpInner,
-        kiInner: payload.kiInner
-      }));
-    }
-
-    if (payload.kind === 'hybrid') {
-      Object.assign(configStore.hybridDraft, normalizeHybridPayload({
-        threshold: payload.threshold,
-        kp: payload.kp,
-        ki: payload.ki,
-        kd: payload.kd,
-        slowInterval: payload.slowInterval
-      }));
-    }
-
     if (payload.kind === 'net') {
       Object.assign(configStore.netDraft, normalizeNetPayload({
         ip: payload.ip,
@@ -529,25 +506,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       applyQueriedPid(payload);
     }
 
-    if (payload.kind === 'cascade') {
-      Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
-        kOuter: payload.kOuter,
-        maxRate: payload.maxRate,
-        kpInner: payload.kpInner,
-        kiInner: payload.kiInner
-      }));
-    }
-
-    if (payload.kind === 'hybrid') {
-      Object.assign(configStore.hybridDraft, normalizeHybridPayload({
-        threshold: payload.threshold,
-        kp: payload.kp,
-        ki: payload.ki,
-        kd: payload.kd,
-        slowInterval: payload.slowInterval
-      }));
-    }
-
     if (payload.kind === 'net') {
       Object.assign(configStore.netDraft, normalizeNetPayload({
         ip: payload.ip,
@@ -585,10 +543,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       kp: Number(lastAppliedPid.value.kp),
       ki: Number(lastAppliedPid.value.ki),
       kd: Number(lastAppliedPid.value.kd),
-      sampleTime: 1,
-      outputLimit: 100,
-      deadband: 0,
-      setpointRamp: 0,
       xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
       boardTemperature: 0,
       telemetry: [],
@@ -765,63 +719,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
         deviceStore.pushAlert({ tone: 'danger', title: 'PID 查询失败', message: error.message || '未知错误' });
       }
       deviceStore.appendEvent(`PID 查询失败：${error.message}`);
-      return null;
-    }
-  }
-
-  async function refreshCascadeParams({ silent = false, channel = null } = {}) {
-    try {
-      const response = await sendChannelCommand('GET=CASCADE', 'cascade', '级联参数查询', channel);
-      if (response?.kind === 'cascade') {
-        Object.assign(configStore.cascadeDraft, normalizeCascadePayload({
-          kOuter: response.kOuter,
-          maxRate: response.maxRate,
-          kpInner: response.kpInner,
-          kiInner: response.kiInner
-        }));
-      }
-      if (!silent) {
-        deviceStore.pushAlert({
-          tone: 'success',
-          title: '级联参数已同步',
-          message: '已读取设备内当前级联控制器参数。'
-        });
-      }
-      return response;
-    } catch (error) {
-      if (!silent) {
-        deviceStore.pushAlert({ tone: 'danger', title: '级联参数查询失败', message: error.message || '未知错误' });
-      }
-      deviceStore.appendEvent(`级联参数查询失败：${error.message}`);
-      return null;
-    }
-  }
-
-  async function refreshHybridParams({ silent = false, channel = null } = {}) {
-    try {
-      const response = await sendChannelCommand('GET=HYBRID', 'hybrid', '混合参数查询', channel);
-      if (response?.kind === 'hybrid') {
-        Object.assign(configStore.hybridDraft, normalizeHybridPayload({
-          threshold: response.threshold,
-          kp: response.kp,
-          ki: response.ki,
-          kd: response.kd,
-          slowInterval: response.slowInterval
-        }));
-      }
-      if (!silent) {
-        deviceStore.pushAlert({
-          tone: 'success',
-          title: '混合参数已同步',
-          message: '已读取设备内当前混合控制器参数。'
-        });
-      }
-      return response;
-    } catch (error) {
-      if (!silent) {
-        deviceStore.pushAlert({ tone: 'danger', title: '混合参数查询失败', message: error.message || '未知错误' });
-      }
-      deviceStore.appendEvent(`混合参数查询失败：${error.message}`);
       return null;
     }
   }
@@ -1026,10 +923,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       kp: Number(lastAppliedPid.value.kp),
       ki: Number(lastAppliedPid.value.ki),
       kd: Number(lastAppliedPid.value.kd),
-      sampleTime: 1,
-      outputLimit: 100,
-      deadband: 0,
-      setpointRamp: 0,
       xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
       boardTemperature: Number(toNumeric(payload.boardTemp, 0).toFixed(2)),
       telemetry: Array.isArray(payload.telemetry) ? payload.telemetry : []
@@ -1102,10 +995,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       kp: Number(row.kp),
       ki: Number(row.ki),
       kd: Number(row.kd),
-      sampleTime: Number(row.sampleTime),
-      outputLimit: Number(row.outputLimit),
-      deadband: Number(row.deadband),
-      setpointRamp: Number(row.setpointRamp),
       sampleIndex: Number(row.sampleIndex),
       xAxisSecondsPerDivision: Number(row.xAxisSecondsPerDivision)
     }));
@@ -1396,66 +1285,6 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function dispatchCascadeParams(channel = null) {
-    const targetChannel = resolveChannel(channel);
-    const normalized = normalizeCascadePayload(configStore.cascadeDraft);
-    Object.assign(configStore.cascadeDraft, normalized);
-
-    try {
-      await sendChannelCommand(
-        `CASCADE=${normalized.kOuter.toFixed(2)},${normalized.maxRate.toFixed(2)},${normalized.kpInner.toFixed(2)},${normalized.kiInner.toFixed(2)}`,
-        'ack',
-        '级联参数下发',
-        targetChannel
-      );
-
-      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
-      deviceStore.appendEvent(
-        `级联参数已下发到${channelLabel}控制器：K_outer ${normalized.kOuter} / MaxRate ${normalized.maxRate} / Kp_inner ${normalized.kpInner} / Ki_inner ${normalized.kiInner}`
-      );
-      deviceStore.pushAlert({
-        tone: 'success',
-        title: '级联参数已下发',
-        message: `已更新${channelLabel}控制器级联参数。`
-      });
-      return { applied: true, channel: targetChannel };
-    } catch (error) {
-      deviceStore.pushAlert({ tone: 'danger', title: '级联参数下发失败', message: error.message || '未知错误' });
-      deviceStore.appendEvent(`级联参数下发失败：${error.message}`);
-      return { applied: false };
-    }
-  }
-
-  async function dispatchHybridParams(channel = null) {
-    const targetChannel = resolveChannel(channel);
-    const normalized = normalizeHybridPayload(configStore.hybridDraft);
-    Object.assign(configStore.hybridDraft, normalized);
-
-    try {
-      await sendChannelCommand(
-        `HYBRID=${normalized.threshold.toFixed(2)},${normalized.kp.toFixed(2)},${normalized.ki.toFixed(3)},${normalized.kd.toFixed(2)},${normalized.slowInterval}`,
-        'ack',
-        '混合参数下发',
-        targetChannel
-      );
-
-      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
-      deviceStore.appendEvent(
-        `混合参数已下发到${channelLabel}控制器：TH ${normalized.threshold} / Kp ${normalized.kp} / Ki ${normalized.ki} / Kd ${normalized.kd} / 慢速间隔 ${normalized.slowInterval}s`
-      );
-      deviceStore.pushAlert({
-        tone: 'success',
-        title: '混合参数已下发',
-        message: `已更新${channelLabel}控制器混合参数。`
-      });
-      return { applied: true, channel: targetChannel };
-    } catch (error) {
-      deviceStore.pushAlert({ tone: 'danger', title: '混合参数下发失败', message: error.message || '未知错误' });
-      deviceStore.appendEvent(`混合参数下发失败：${error.message}`);
-      return { applied: false };
-    }
-  }
-
   async function dispatchNetConfig(channel = null) {
     const targetChannel = resolveChannel(channel);
     const normalized = normalizeNetPayload(configStore.netDraft);
@@ -1645,22 +1474,16 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     applyProfile,
     resetPidDraft,
     syncDraftToChannels,
-    cascadeDraft,
-    hybridDraft,
     netDraft,
     serialProtocolState,
     tcpProtocolState,
     refreshControllerState,
     refreshPidParameters,
-    refreshCascadeParams,
-    refreshHybridParams,
     refreshNetConfig,
     refreshControllerSnapshot,
     setControllerMode,
     applyManualPwm,
     dispatchPidParameters,
-    dispatchCascadeParams,
-    dispatchHybridParams,
     dispatchNetConfig,
     dispatchSaveConfig,
     dispatchResetConfig,

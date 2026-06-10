@@ -132,7 +132,7 @@ async function ensureCsvHeader(filePath) {
   try {
     await access(filePath, constants.F_OK)
   } catch {
-    const header = 'sampleIndex,elapsedSeconds,channel,temperature,setpoint,requestedSetpoint,controlOutput,disturbance,overshootPercent,settlingTime,mode,kp,ki,kd,sampleTime,outputLimit,deadband,setpointRamp,xAxisSecondsPerDivision,recordedAt\n'
+    const header = 'sampleIndex,elapsedSeconds,channel,temperature,setpoint,requestedSetpoint,controlOutput,disturbance,overshootPercent,settlingTime,mode,kp,ki,kd,xAxisSecondsPerDivision,recordedAt\n'
     await appendFile(filePath, header, 'utf8')
   }
 }
@@ -159,10 +159,6 @@ async function appendChannelSamples(channel, rows, directory, sessionId) {
       row.kp,
       row.ki,
       row.kd,
-      row.sampleTime,
-      row.outputLimit,
-      row.deadband,
-      row.setpointRamp,
       row.xAxisSecondsPerDivision,
       new Date(row.timestamp).toISOString()
     ].map(escapeCsvValue).join(','))

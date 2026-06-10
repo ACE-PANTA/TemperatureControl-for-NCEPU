@@ -77,6 +77,363 @@ npm run build:linux
 
 Windows 打包结果会带管理员权限清单，安装后的程序启动时会自动请求管理员权限。
 
+---
+
+# Temperature Control System (STM32F407 + LAN8720A)
+
+## 1. Hardware Connections
+
+| Function | Pin | Description |
+|---|---|---|
+| DS18B20 | PB5 | Board temperature sensor |
+| NTC Thermistor | PA0 (ADC1) | Heater temperature feedback |
+| Heater Control | PE5 | Heater MOSFET |
+| TIM9 CH2 | -- | PWM control (heater/fan) |
+| Fan Control | PE4 | Circulation fan enable |
+| Buzzer | PB6 | Alert sound |
+| Key UP | PD1 | Increase |
+| Key DOWN | PD2 | Decrease |
+| Key STEP | PD3 | Step toggle (1/5/10) |
+| Key AUTO | PD4 | Auto/Manual toggle |
+| LED1 | PB3 | Status indicator |
+| LED2 | PB4 | Status indicator |
+| HMI Display | PD8/PD9 (USART3) | Touch screen |
+| Debug UART | PA9/PA10 (USART1) | PC communication |
+| Ethernet (RMII) | PA1,PA2,PA7,PC1,PC4,PC5,PB11,PB12,PB13 | LAN8720A |
+| ETH_RESET | PB0 | LAN8720A reset |
+
+### Network Setup (Direct PC Connection)
+
+Default: **Static IP** (no DHCP).
+
+**Step 1: Physical Connection**
+- Connect STM32 RJ45 to PC Ethernet port with a cable.
+- Check that the Link LED (green) near the LAN8720A is **solid ON**.
+
+**Step 2: Configure PC Static IP**
+1. Control Panel -> Network and Sharing Center -> Change Adapter Settings
+2. Right-click Ethernet -> Properties -> Internet Protocol Version 4 (TCP/IPv4)
+3. Select "Use the following IP address":
+   - IP address: `192.168.1.10`
+   - Subnet mask: `255.255.255.0`
+   - Default gateway: leave blank
+4. Click OK
+
+**Step 3: Verify**
+```bash
+ping 192.168.1.100
+```
+Expected: `Reply from 192.168.1.100: bytes=32 time<1ms TTL=64`
+
+**Step 4: TCP Connection**
+```bash
+nc 192.168.1.100 8000
+# Or PuTTY: Connection type=Raw, Host=192.168.1.100, Port=8000
+```
+
+### Router Connection
+
+- Router LAN must be `192.168.1.x` subnet
+- `192.168.1.100` must not be occupied by another device
+- Use `!NET=...` via UART to change IP, then `!SAVE`
+
+---
+
+## 2. Control Architecture
+
+```
+                    +-------------------+
+Target Temp ------->|                   |------> PWM Output (0~100%)
+                    |  Incremental PID  |          |
+Feedback Temp ----->|  + Dead-time      |     +----+----+
+                    |  Compensation     |     |         |
+                    +-------------------+   Heater     Fan
+                                             (>0)      (<0)
+```
+
+### How It Works
+
+The thermal system has a large **pure time delay** (e.g., heat takes seconds to propagate from the heater to the NTC sensor). A traditional PID that adjusts every second will over-correct because the effect of the previous adjustment hasn't reached the sensor yet.
+
+**Solution: Dead-time aware incremental PID**
+
+1. **Error history** is updated every second (for accurate derivative calculation)
+2. **PID output** is only updated every `pid_interval` seconds (default: 5s, >= system dead time)
+3. Between adjustments, PWM is held constant, allowing the thermal system to respond
+4. A **deadband** (default: +/-0.3°C) freezes output when the temperature is close enough
+5. **Output rate limiting** (default: +/-8% per step) prevents aggressive PWM swings
+
+### PID Formula
+
+```
+delta_u = Kp * [e(k) - e(k-1)]
+        + Ki * e(k) * Ts
+        + Kd * [e(k) - 2*e(k-1) + e(k-2)] / Ts
+
+output = clamp(output_prev + delta_u, 0, 100)
+```
+
+Where:
+- `e(k)` = target temperature - current temperature
+- `Ts` = `pid_interval` (sampling period in seconds)
+- `delta_u` is clamped to `+/- pid_max_delta`
+
+---
+
+## 3. Parameters
+
+### A. System Control
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `manual_flag` | 1 (Manual) | 0/1 | 0=Auto, 1=Manual PWM |
+| `target_temp` | 30.0 | -10~100 °C | Target temperature (auto mode) |
+| `manual_pwm` | 0 | -100~100 | Manual PWM value |
+| `step_value` | 1 | 1/5/10 | Key step amount |
+
+### B. Incremental PID
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `pid_kp` | 3.0 | 0.1~50 | Kp: error trend gain |
+| `pid_ki` | 0.3 | 0~5 | Ki: persistent error driver |
+| `pid_kd` | 1.0 | 0~10 | Kd: damping, anti-overshoot |
+| `pid_interval` | 5 | 1~60 sec | PID adjust interval (>= system dead time) |
+| `pid_deadband` | 0.3 | 0.1~2.0 °C | Deadband: output frozen within this error |
+| `pid_max_delta` | 8.0 | 1~30 % | Max output change per PID step |
+
+### C. Network
+
+| Parameter | Default | Description |
+|---|---|---|
+| `eth_ip` | 192.168.1.100 | Static IP (reboot required) |
+| `eth_gateway` | 192.168.1.1 | Gateway (reboot required) |
+| `eth_netmask` | 255.255.255.0 | Netmask (reboot required) |
+| `tcp_port` | 8000 | TCP listen port (reboot required) |
+| `eth_mac` | 02:00:00:00:00:01 | MAC address (reboot required) |
+
+---
+
+## 4. Command Protocol
+
+### Frame Format
+
+```
+Request: !BODY\r\n              (without checksum)
+         !BODY*XX\r\n           (with XOR checksum)
+
+Reply:   !ACK=OK\r\n            (success)
+         !ACK=OK*XX\r\n
+         !ACK=ERR\r\n           (failure)
+         !ACK=ERR*XX\r\n
+         !response\r\n          (query result)
+         !response*XX\r\n
+```
+
+- `!` frame header, `*XX` optional XOR checksum, `\r\n` frame tail
+- Checksum: XOR of all bytes from `!` through last body character, formatted as 2-char uppercase hex
+- Device accepts both formats (with and without checksum)
+- **UART (USART1) and TCP (port 8000) use the same protocol**
+
+### Commands
+
+#### System Control
+
+| Command | Example | Description |
+|---|---|---|
+| `MODE=AUTO` | `!MODE=AUTO\r\n` | Switch to auto mode |
+| `MODE=MAN` | `!MODE=MAN\r\n` | Switch to manual mode |
+| `TEMP=58.0` | `!TEMP=58.0\r\n` | Set target temperature (°C) |
+| `PWM=50` | `!PWM=50\r\n` | Set manual PWM (-100~100, manual only) |
+| `STEP=5` | `!STEP=5\r\n` | Set key step (1/5/10) |
+
+#### PID Tuning
+
+| Command | Example | Description |
+|---|---|---|
+| `PID=3.0,0.3,1.0` | `!PID=3.0,0.3,1.0\r\n` | Set Kp, Ki, Kd |
+| `PID=3.0,0.3,1.0,5` | +interval | Also set pid_interval |
+| `PID=3.0,0.3,1.0,5,0.3` | +deadband | Also set deadband |
+| `PID=3.0,0.3,1.0,5,0.3,8.0` | Full | Set all 6 params |
+
+#### Network (reboot required after change)
+
+| Command | Example |
+|---|---|
+| `NET=192.168.1.100,192.168.1.1,255.255.255.0,8000` | Set IP, GW, Netmask, Port |
+| `MAC=02:00:00:00:00:01` | Set MAC address |
+
+#### Query
+
+| Command | Reply Example |
+|---|---|
+| `GET=STATE` | `STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575` |
+| `GET=PID` | `PID=KP:3.00,KI:0.300,KD:1.00,INT:5,DB:0.30,MD:8.0` |
+| `GET=NET` | `NET=IP:192.168.1.100,GW:192.168.1.1,NM:255.255.255.0,PORT:8000` |
+| `GET=ETH` | `ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0` |
+| `GET=CONFIG` | All config parameters (multi-line) |
+
+#### Persistence
+
+| Command | Description |
+|---|---|
+| `SAVE` | Save current config to Flash immediately |
+| `RESET` | Restore factory defaults (preserves MAC) |
+
+> Parameters auto-save to Flash after 500ms delay on change. `!SAVE` forces immediate save.
+
+---
+
+## 5. Response Fields
+
+### STATE (`GET=STATE`)
+
+```
+STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| MODE | Mode | AUTO=自动, MAN=手动 |
+| PWM | Current PWM | -100~100, positive=heat, negative=fan |
+| GOAL | Target ×10 | e.g. 580 = 58.0°C |
+| FB | Feedback ×10 | e.g. 575 = 57.5°C |
+
+### PID (`GET=PID`)
+
+```
+PID=KP:3.00,KI:0.300,KD:1.00,INT:5,DB:0.30,MD:8.0
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| KP | pid_kp | Proportional gain |
+| KI | pid_ki | Integral gain |
+| KD | pid_kd | Derivative gain |
+| INT | pid_interval | Adjust interval (seconds) |
+| DB | pid_deadband | Deadband (°C) |
+| MD | pid_max_delta | Max output change per step (%) |
+
+### ETH Diagnostics (`GET=ETH`)
+
+```
+ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0
+```
+
+| Field | Meaning |
+|---|---|
+| LINK | 1=cable connected, 0=disconnected |
+| PHY | PHY chip address (0 or 1, 255=not found) |
+| ERR | Error code (0=OK) |
+| PHYID | Chip ID (0007C0F1=LAN8720A, 00000000=not detected) |
+| RX | Received packets |
+| TX | Transmitted packets |
+| ARP | ARP replies |
+| ICMP | Ping replies |
+| ANEG | 1=auto-negotiation complete, 0=not complete |
+| TCP | 1=client connected, 0=no client |
+
+### Ethernet Error Codes
+
+| Code | Name | Meaning | Fix |
+|---|---|---|---|
+| 0 | `ETH_ERR_OK` | Link OK | -- |
+| 1 | `ETH_ERR_NO_PHY` | PHY chip not found | Check PHY soldering/power/crystal |
+| 2 | `ETH_ERR_NO_LINK` | No cable link | Check cable, peer power |
+| 3 | `ETH_ERR_ANEG_TIMEOUT` | Auto-negotiation timeout | Check 50MHz RMII clock |
+| 4 | `ETH_ERR_NOT_INITED` | ETH not initialized | Check eth.c included in build |
+
+---
+
+## 6. Quick Start
+
+### First Power-On
+
+```
+1. Default: manual mode, target 30°C
+2. Connect UART (115200 8N1) or TCP (nc 192.168.1.100 8000)
+3. Send: MODE=AUTO
+4. Send: TEMP=58.0
+5. Observe: PID adjusts every pid_interval seconds (default 5s)
+```
+
+### Tuning Guide
+
+```
+1. Set the dead time:
+   PID=3.0,0.3,1.0,5        (5s interval for slow thermal systems)
+   Increase pid_interval for larger thermal mass (e.g. 10, 15, 20)
+
+2. Tune responsiveness:
+   Temperature rises too slowly -> Increase Kp (e.g. 3.0 -> 5.0)
+   Temperature overshoots      -> Increase Kd (e.g. 1.0 -> 3.0)
+   Steady-state error persists -> Increase Ki (e.g. 0.3 -> 0.6)
+   PWM oscillates wildly       -> Decrease pid_max_delta (e.g. 8.0 -> 4.0)
+
+3. Set deadband:
+   Small oscillations near target -> Increase pid_deadband (e.g. 0.3 -> 0.5)
+   Temperature stays off by 0.5°C -> Decrease pid_deadband (e.g. 0.3 -> 0.1)
+
+4. Save:
+   SAVE
+```
+
+---
+
+## 7. Build (STM32)
+
+### Keil MDK
+
+- Project: `USER/DS18B20.uvprojx`
+- MCU: STM32F407VETx
+- StdPeriph Library: V1.4.0
+- Compiler: ARMCC V5.06
+
+### File Structure
+
+```
+USER/
+  main.c              Main program
+  app_config.h/.c     Unified config system
+  flash_params.h/.c   Flash persistence
+  pid_control.h/.c    PID controller
+
+HARDWARE/
+  ETH/eth.h/.c        Ethernet driver
+  LED/                LED driver
+  DS18B20/            Temperature sensor
+  KEY/                Keys
+  BEEP/               Buzzer
+  TIMER/              Timer
+  ADC/                ADC
+  HMI/                HMI display
+  PWM/                PWM output
+  DataScope_DP/       Data oscilloscope
+
+SYSTEM/
+  delay/              Delay
+  sys/                System
+  usart/              UART
+
+FWLIB/                STM32F4 StdPeriph Library
+```
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Temp stuck below target | Ki too weak / max_delta too small | Increase Ki (0.3→0.6) or max_delta (8→12) |
+| Large overshoot | Kp too high / Kd too low / interval too short | Decrease Kp, increase Kd, increase pid_interval |
+| PWM oscillates (0→100→0) | max_delta too large / interval too short | Decrease max_delta (8→4), increase interval (5→10) |
+| Steady oscillation near target | Deadband too small | Increase pid_deadband (0.3→0.5) |
+| No response to errors | pid_interval too long | Decrease pid_interval |
+| Network not connecting | IP mismatch / hardware | Use UART `GET=ETH` for diagnostics |
+| Flash save fails | Sector erase error | Check FLASH_Sector_7 not occupied |
+
+---
+
 ## 主要页面说明
 
 ### 1. 首页
@@ -97,7 +454,7 @@ Windows 打包结果会带管理员权限清单，安装后的程序启动时会
 
 - 曲线横轴会随着采样推进持续更新
 - 曲线支持拖动回看历史数据
-- 可通过“回到最新”按钮恢复实时视图
+- 可通过"回到最新"按钮恢复实时视图
 
 ### 2. PID 整定页
 

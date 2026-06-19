@@ -1,7 +1,11 @@
 import { reactive, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import {
-  defaultPidDraft,
+  defaultTranDraft,
+  defaultFineDraft,
+  defaultSmithDraft,
+  defaultDeadband,
+  defaultFineEnabled,
   defaultNetDraft,
   defaultPlantDrafts
 } from '../services/pidSimulation.js';
@@ -37,11 +41,47 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function createParamRecordSnapshot({ tranDraft, fineDraft, smithDraft, deadband, fineEnabled }) {
+  return {
+    tran: clone(tranDraft),
+    fine: clone(fineDraft),
+    smith: clone(smithDraft),
+    deadband,
+    fineEnabled
+  };
+}
+
+function normalizeParamRecords(records) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+
+  return records
+    .filter((record) => record && record.name && record.snapshot)
+    .map((record) => ({
+      id: record.id || `record-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name: String(record.name),
+      createdAt: Number(record.createdAt) || Date.now(),
+      snapshot: {
+        tran: { ...clone(defaultTranDraft), ...(record.snapshot.tran || {}) },
+        fine: { ...clone(defaultFineDraft), ...(record.snapshot.fine || {}) },
+        smith: { ...clone(defaultSmithDraft), ...(record.snapshot.smith || {}) },
+        deadband: Number.isFinite(Number(record.snapshot.deadband)) ? Number(record.snapshot.deadband) : defaultDeadband,
+        fineEnabled: typeof record.snapshot.fineEnabled === 'boolean' ? record.snapshot.fineEnabled : defaultFineEnabled
+      }
+    }));
+}
+
 export const useSystemConfigStore = defineStore('systemConfig', () => {
   const settings = reactive(clone(defaultSystemSettings));
-  const pidDraft = reactive(clone(defaultPidDraft));
+  const tranDraft = reactive(clone(defaultTranDraft));
+  const fineDraft = reactive(clone(defaultFineDraft));
+  const smithDraft = reactive(clone(defaultSmithDraft));
+  const deadband = ref(defaultDeadband);
+  const fineEnabled = ref(defaultFineEnabled);
   const netDraft = reactive(clone(defaultNetDraft));
   const plantDraft = reactive(clone(defaultPlantDrafts.serial));
+  const paramRecords = ref([]);
   const initialized = ref(false);
 
   function loadPersistedState() {
@@ -68,13 +108,23 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
       };
 
       Object.assign(settings, mergedSettings);
-      Object.assign(pidDraft, defaultPidDraft, parsed.pidDraft || {});
+      Object.assign(tranDraft, defaultTranDraft, parsed.tranDraft || {});
+      Object.assign(fineDraft, defaultFineDraft, parsed.fineDraft || {});
+      Object.assign(smithDraft, defaultSmithDraft, parsed.smithDraft || {});
+      deadband.value = Number.isFinite(parsed.deadband) ? parsed.deadband : defaultDeadband;
+      fineEnabled.value = typeof parsed.fineEnabled === 'boolean' ? parsed.fineEnabled : defaultFineEnabled;
       Object.assign(netDraft, defaultNetDraft, parsed.netDraft || {});
       Object.assign(plantDraft, defaultPlantDrafts.serial, parsed.plantDraft || parsed.plantDrafts?.serial || {});
+      paramRecords.value = normalizeParamRecords(parsed.paramRecords);
     } catch {
       Object.assign(settings, defaultSystemSettings);
-      Object.assign(pidDraft, defaultPidDraft);
+      Object.assign(tranDraft, defaultTranDraft);
+      Object.assign(fineDraft, defaultFineDraft);
+      Object.assign(smithDraft, defaultSmithDraft);
+      deadband.value = defaultDeadband;
+      fineEnabled.value = defaultFineEnabled;
       Object.assign(plantDraft, defaultPlantDrafts.serial);
+      paramRecords.value = [];
     }
   }
 
@@ -87,11 +137,43 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
       STORAGE_KEY,
       JSON.stringify({
         settings: clone(settings),
-        pidDraft: clone(pidDraft),
+        tranDraft: clone(tranDraft),
+        fineDraft: clone(fineDraft),
+        smithDraft: clone(smithDraft),
+        deadband: deadband.value,
+        fineEnabled: fineEnabled.value,
         netDraft: clone(netDraft),
-        plantDraft: clone(plantDraft)
+        plantDraft: clone(plantDraft),
+        paramRecords: clone(paramRecords.value)
       })
     );
+  }
+
+  function addParamRecord(name) {
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) {
+      return null;
+    }
+
+    const record = {
+      id: `record-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name: trimmedName,
+      createdAt: Date.now(),
+      snapshot: createParamRecordSnapshot({
+        tranDraft,
+        fineDraft,
+        smithDraft,
+        deadband: deadband.value,
+        fineEnabled: fineEnabled.value
+      })
+    };
+
+    paramRecords.value = [record, ...paramRecords.value];
+    return record;
+  }
+
+  function removeParamRecord(id) {
+    paramRecords.value = paramRecords.value.filter((record) => record.id !== id);
   }
 
   async function ensureDefaultLogDirectory() {
@@ -127,15 +209,22 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
   loadPersistedState();
 
   watch(
-    () => JSON.stringify({ settings, pidDraft, netDraft, plantDraft }),
+    () => JSON.stringify({ settings, tranDraft, fineDraft, smithDraft, deadband: deadband.value, fineEnabled: fineEnabled.value, netDraft, plantDraft, paramRecords: paramRecords.value }),
     () => persistState()
   );
 
   return {
     settings,
-    pidDraft,
+    tranDraft,
+    fineDraft,
+    smithDraft,
+    deadband,
+    fineEnabled,
     netDraft,
     plantDraft,
+    paramRecords,
+    addParamRecord,
+    removeParamRecord,
     loadPersistedState,
     ensureDefaultLogDirectory,
     chooseLogDirectory

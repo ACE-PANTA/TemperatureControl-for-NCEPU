@@ -40,7 +40,34 @@ const deviceApi = {
   appendChannelSamples: (payload) => ipcRenderer.invoke('device:append-channel-samples', payload),
   getDefaultLogDirectory: () => ipcRenderer.invoke('device:get-default-log-directory'),
   chooseLogDirectory: (defaultPath) => ipcRenderer.invoke('device:choose-log-directory', defaultPath),
-  openPathInShell: (targetPath) => ipcRenderer.invoke('device:open-path-in-shell', targetPath)
+  openPathInShell: (targetPath) => ipcRenderer.invoke('device:open-path-in-shell', targetPath),
+  updateExternalSnapshot: (snapshot) => ipcRenderer.invoke('external:update-snapshot', snapshot),
+  getExternalServiceStatus: () => ipcRenderer.invoke('external:get-service-status'),
+  onExternalServiceStatus: (callback) => {
+    const listener = (_, payload) => callback(payload)
+    ipcRenderer.on('external:service-status', listener)
+    return () => ipcRenderer.removeListener('external:service-status', listener)
+  },
+  onExternalControlRequest: (callback) => {
+    const listener = async (_, request) => {
+      try {
+        const result = await callback(request)
+        ipcRenderer.send('external:control-response', {
+          id: request.id,
+          ok: true,
+          result
+        })
+      } catch (error) {
+        ipcRenderer.send('external:control-response', {
+          id: request.id,
+          ok: false,
+          error: error.message || 'External control request failed'
+        })
+      }
+    }
+    ipcRenderer.on('external:control-request', listener)
+    return () => ipcRenderer.removeListener('external:control-request', listener)
+  }
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

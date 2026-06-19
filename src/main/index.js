@@ -5,6 +5,8 @@ import { join } from 'path'
 import { networkInterfaces } from 'os'
 import { spawn, spawnSync } from 'child_process'
 import net from 'net'
+import http from 'http'
+import { WebSocketServer } from 'ws'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { SerialPort } from 'serialport'
 import icon from '../../resources/logo.png?asset'
@@ -20,6 +22,19 @@ let serialCommandChain = Promise.resolve()
 let tcpCommandChain = Promise.resolve()
 const serialProtocolWaiters = new Set()
 const tcpProtocolWaiters = new Set()
+const externalControlWaiters = new Map()
+let externalControlRequestId = 0
+let latestExternalSnapshot = null
+let externalHttpServer = null
+let externalWsServer = null
+let externalWsHttpServer = null
+const externalWsClients = new Set()
+const externalServiceStatus = {
+  http: { port: 8056, running: false, error: '' },
+  websocket: { port: 8057, running: false, error: '', clients: 0 },
+  mcp: { port: 8056, path: '/mcp', running: false, error: '' },
+  renderer: { ready: false, lastSnapshotAt: null }
+}
 
 const DATASCOPE_FRAME_HEADER = '$'.charCodeAt(0)
 const DATASCOPE_FRAME_LENGTH = 14
@@ -132,7 +147,7 @@ async function ensureCsvHeader(filePath) {
   try {
     await access(filePath, constants.F_OK)
   } catch {
-    const header = 'sampleIndex,elapsedSeconds,channel,temperature,setpoint,requestedSetpoint,controlOutput,disturbance,overshootPercent,settlingTime,mode,kp,ki,kd,xAxisSecondsPerDivision,recordedAt\n'
+    const header = 'sampleIndex,elapsedSeconds,channel,temperature,setpoint,requestedSetpoint,controlOutput,disturbance,overshootPercent,settlingTime,mode,tranKp,tranKi,tranKd,tranInterval,tranSepThreshold,fineKp,fineKi,fineKd,fineInterval,fineRange,fineEntryMin,fineEntryMax,fineEnabled,deadband,xAxisSecondsPerDivision,recordedAt\n'
     await appendFile(filePath, header, 'utf8')
   }
 }
@@ -156,9 +171,20 @@ async function appendChannelSamples(channel, rows, directory, sessionId) {
       row.overshootPercent,
       row.settlingTime ?? '',
       row.mode,
-      row.kp,
-      row.ki,
-      row.kd,
+      row.tranKp,
+      row.tranKi,
+      row.tranKd,
+      row.tranInterval,
+      row.tranSepThreshold,
+      row.fineKp,
+      row.fineKi,
+      row.fineKd,
+      row.fineInterval,
+      row.fineRange,
+      row.fineEntryMin,
+      row.fineEntryMax,
+      row.fineEnabled,
+      row.deadband,
       row.xAxisSecondsPerDivision,
       new Date(row.timestamp).toISOString()
     ].map(escapeCsvValue).join(','))
@@ -259,6 +285,16 @@ function normalizeControllerMode(rawMode) {
   return normalized || null
 }
 
+function normalizeControllerPhase(rawPhase) {
+  const normalized = String(rawPhase ?? '').trim().toUpperCase()
+
+  if (normalized === 'MAN' || normalized === 'TRAN' || normalized === 'FINE') {
+    return normalized
+  }
+
+  return normalized || null
+}
+
 function parseTenthsValue(rawValue) {
   const numericValue = Number.parseFloat(rawValue ?? '')
   if (!Number.isFinite(numericValue)) {
@@ -320,9 +356,11 @@ function parseSerialProtocolPacket(packet) {
       body,
       hasChecksum,
       mode: normalizeControllerMode(fields.MODE),
+      phase: normalizeControllerPhase(fields.PHASE),
       pwm: Number.parseFloat(fields.PWM ?? ''),
       goal: parseTenthsValue(fields.GOAL),
-      feedback: parseTenthsValue(fields.FB)
+      feedback: parseTenthsValue(fields.FB),
+      predictedFeedback: parseTenthsValue(fields.PFB)
     }
 
     console.log('[serial:state:parsed]', {
@@ -334,6 +372,101 @@ function parseSerialProtocolPacket(packet) {
     return parsed
   }
 
+  if (body.startsWith('TRAN=')) {
+    const fields = parseKeyValueBody(body.slice(5))
+    return {
+      kind: 'tran',
+      packet,
+      body,
+      hasChecksum,
+      kp: Number.parseFloat(fields.KP ?? ''),
+      ki: Number.parseFloat(fields.KI ?? ''),
+      kd: Number.parseFloat(fields.KD ?? ''),
+      interval: Number.parseInt(fields.INT ?? '0', 10) || 0,
+      sepThreshold: Number.parseFloat(fields.SEP ?? fields.ST ?? '')
+    }
+  }
+
+  if (body.startsWith('PHASE=')) {
+    return {
+      kind: 'phase',
+      packet,
+      body,
+      hasChecksum,
+      phase: normalizeControllerPhase(body.slice(6))
+    }
+  }
+
+  if (body.startsWith('FINE=')) {
+    const fields = parseKeyValueBody(body.slice(5))
+    return {
+      kind: 'fine',
+      packet,
+      body,
+      hasChecksum,
+      kp: Number.parseFloat(fields.KP ?? ''),
+      ki: Number.parseFloat(fields.KI ?? ''),
+      kd: Number.parseFloat(fields.KD ?? ''),
+      interval: Number.parseInt(fields.INT ?? '0', 10) || 0,
+      range: Number.parseFloat(fields.FR ?? fields.RNG ?? ''),
+      entryMin: Number.parseFloat(fields.EMIN ?? fields.EMN ?? ''),
+      entryMax: Number.parseFloat(fields.EMAX ?? fields.EMX ?? ''),
+      stableWindow: Number.parseInt(fields.SW ?? '0', 10) || 0,
+      stableDelta: Number.parseFloat(fields.SD ?? '')
+    }
+  }
+
+  if (body.startsWith('DEADBAND=')) {
+    const rawValue = body.slice(9).trim()
+    return {
+      kind: 'deadband',
+      packet,
+      body,
+      hasChecksum,
+      deadband: Number.parseFloat(rawValue)
+    }
+  }
+
+  if (body.startsWith('FINEEN=')) {
+    const rawValue = body.slice(7).trim()
+    return {
+      kind: 'fineEnable',
+      packet,
+      body,
+      hasChecksum,
+      enabled: rawValue === '1' || rawValue.toUpperCase() === 'ON' || rawValue.toUpperCase() === 'TRUE'
+    }
+  }
+
+  if (body.startsWith('SMITH=')) {
+    const fields = parseKeyValueBody(body.slice(6))
+    const parts = body.slice(6).split(',').map((part) => part.trim())
+    const rawEnabled = fields.EN ?? fields.ENABLE ?? fields.E ?? ''
+    return {
+      kind: 'smith',
+      packet,
+      body,
+      hasChecksum,
+      enabled: (rawEnabled || parts[0]) === '1' || (rawEnabled || parts[0]).toUpperCase() === 'ON' || (rawEnabled || parts[0]).toUpperCase() === 'TRUE',
+      gain: Number.parseFloat(fields.GAIN ?? fields.G ?? parts[1] ?? ''),
+      tau: Number.parseFloat(fields.TAU ?? fields.T ?? parts[2] ?? ''),
+      delay: Number.parseFloat(fields.DELAY ?? fields.DLY ?? fields.D ?? parts[3] ?? ''),
+      blend: Number.parseFloat(fields.BLEND ?? fields.B ?? parts[4] ?? ''),
+      maxLead: Number.parseFloat(fields.MAXLEAD ?? fields.ML ?? fields.MAX_LEAD ?? parts[5] ?? '')
+    }
+  }
+
+  if (body.startsWith('SMITHEN=')) {
+    const rawValue = body.slice(8).trim()
+    return {
+      kind: 'smithEnable',
+      packet,
+      body,
+      hasChecksum,
+      enabled: rawValue === '1' || rawValue.toUpperCase() === 'ON' || rawValue.toUpperCase() === 'TRUE'
+    }
+  }
+
   if (body.startsWith('PID=')) {
     const fields = parseKeyValueBody(body.slice(4))
     return {
@@ -343,7 +476,11 @@ function parseSerialProtocolPacket(packet) {
       hasChecksum,
       kp: Number.parseFloat(fields.KP ?? ''),
       ki: Number.parseFloat(fields.KI ?? ''),
-      kd: Number.parseFloat(fields.KD ?? '')
+      kd: Number.parseFloat(fields.KD ?? ''),
+      interval: Number.parseInt(fields.INT ?? '0', 10) || 0,
+      deadband: Number.parseFloat(fields.DB ?? ''),
+      maxDelta: Number.parseFloat(fields.MD ?? ''),
+      fineTune: Number.parseFloat(fields.FT ?? '')
     }
   }
 
@@ -644,6 +781,461 @@ function broadcastToRenderers(channel, payload) {
       window.webContents.send(channel, payload)
     }
   }
+}
+
+function updateExternalServiceStatus(partial = {}) {
+  Object.assign(externalServiceStatus, {
+    ...externalServiceStatus,
+    ...partial
+  })
+  broadcastToRenderers('external:service-status', externalServiceStatus)
+  broadcastExternalWs({
+    type: 'service_status',
+    payload: externalServiceStatus,
+    timestamp: Date.now()
+  })
+}
+
+function broadcastExternalWs(message) {
+  const raw = JSON.stringify(message)
+  for (const client of externalWsClients) {
+    if (client.readyState === 1) {
+      client.send(raw)
+    }
+  }
+}
+
+function setJsonResponse(response, statusCode, payload) {
+  const body = JSON.stringify(payload)
+  response.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type'
+  })
+  response.end(body)
+}
+
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = ''
+    request.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 1024 * 1024) {
+        request.destroy()
+        reject(new Error('Request body too large'))
+      }
+    })
+    request.on('end', () => {
+      if (!body.trim()) {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(body))
+      } catch {
+        reject(new Error('Invalid JSON body'))
+      }
+    })
+    request.on('error', reject)
+  })
+}
+
+function getExternalTargetWindow() {
+  return BrowserWindow.getAllWindows().find((window) => !window.isDestroyed())
+}
+
+function invokeExternalRendererAction(action, payload = {}, timeoutMs = 5000) {
+  const targetWindow = getExternalTargetWindow()
+  if (!targetWindow) {
+    return Promise.reject(new Error('Renderer is not available'))
+  }
+
+  const id = `external-${Date.now()}-${++externalControlRequestId}`
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      externalControlWaiters.delete(id)
+      reject(new Error(`External action timed out: ${action}`))
+    }, timeoutMs)
+
+    externalControlWaiters.set(id, { resolve, reject, timer })
+    targetWindow.webContents.send('external:control-request', {
+      id,
+      action,
+      payload,
+      timestamp: Date.now()
+    })
+  })
+}
+
+function ok(data = {}) {
+  return { ok: true, ...data }
+}
+
+async function handleExternalApiRequest(request, response) {
+  if (request.method === 'OPTIONS') {
+    setJsonResponse(response, 204, {})
+    return
+  }
+
+  const url = new URL(request.url, 'http://127.0.0.1:8056')
+  const path = url.pathname.replace(/\/+$/, '') || '/'
+
+  try {
+    if (request.method === 'GET' && path === '/health') {
+      setJsonResponse(response, 200, ok({ services: externalServiceStatus }))
+      return
+    }
+
+    if (request.method === 'GET' && path === '/api/status') {
+      setJsonResponse(response, 200, ok({ services: externalServiceStatus }))
+      return
+    }
+
+    if (request.method === 'GET' && path === '/api/snapshot') {
+      setJsonResponse(response, 200, ok({ snapshot: latestExternalSnapshot }))
+      return
+    }
+
+    if (request.method === 'POST' && path === '/mcp') {
+      const body = await readJsonBody(request)
+      setJsonResponse(response, 200, await handleMcpRequest(body))
+      return
+    }
+
+    if (request.method !== 'POST') {
+      setJsonResponse(response, 404, { ok: false, error: 'Not found' })
+      return
+    }
+
+    const body = await readJsonBody(request)
+    const actionByPath = {
+      '/api/refresh': 'refresh_snapshot',
+      '/api/mode': 'set_mode',
+      '/api/manual-pwm': 'set_manual_pwm',
+      '/api/target-temperature': 'set_target_temperature',
+      '/api/pid/tran': 'set_tran_pid',
+      '/api/pid/fine': 'set_fine_pid',
+      '/api/pid/smith': 'set_smith',
+      '/api/pid/deadband': 'set_deadband',
+      '/api/pid/fine-enable': 'set_fine_enable',
+      '/api/save': 'save_config'
+    }
+    const action = actionByPath[path]
+    if (!action) {
+      setJsonResponse(response, 404, { ok: false, error: 'Not found' })
+      return
+    }
+
+    const result = await invokeExternalRendererAction(action, body)
+    setJsonResponse(response, 200, ok({ result, snapshot: latestExternalSnapshot }))
+  } catch (error) {
+    setJsonResponse(response, 500, { ok: false, error: error.message || 'External request failed' })
+  }
+}
+
+const mcpTools = [
+  {
+    name: 'temperature_get_status',
+    description: 'Get latest temperature-control status, mode, condition and PID configuration.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'temperature_refresh_snapshot',
+    description: 'Query the controller and refresh mode, condition, TRAN/FINE/Smith PID, fine-enable and deadband.',
+    inputSchema: {
+      type: 'object',
+      properties: { channel: { type: 'string', enum: ['serial', 'ethernet'] } }
+    }
+  },
+  {
+    name: 'temperature_set_mode',
+    description: 'Switch controller mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['AUTO', 'MAN'] },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['mode']
+    }
+  },
+  {
+    name: 'temperature_set_manual_pwm',
+    description: 'Set manual PWM output.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pwm: { type: 'number', minimum: -100, maximum: 100 },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['pwm']
+    }
+  },
+  {
+    name: 'temperature_set_target_temperature',
+    description: 'Set auto-mode target temperature.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        temperature: { type: 'number' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['temperature']
+    }
+  },
+  {
+    name: 'temperature_set_tran_pid',
+    description: 'Set TRAN condition PID parameters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kp: { type: 'number' },
+        ki: { type: 'number' },
+        kd: { type: 'number' },
+        interval: { type: 'number' },
+        sepThreshold: { type: 'number' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['kp', 'ki', 'kd']
+    }
+  },
+  {
+    name: 'temperature_set_fine_pid',
+    description: 'Set FINE condition PID parameters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kp: { type: 'number' },
+        ki: { type: 'number' },
+        kd: { type: 'number' },
+        interval: { type: 'number' },
+        range: { type: 'number' },
+        entryMin: { type: 'number' },
+        entryMax: { type: 'number' },
+        stableWindow: { type: 'number' },
+        stableDelta: { type: 'number' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['kp', 'ki', 'kd']
+    }
+  },
+  {
+    name: 'temperature_set_smith',
+    description: 'Set Smith predictor parameters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean' },
+        gain: { type: 'number' },
+        tau: { type: 'number' },
+        delay: { type: 'number' },
+        blend: { type: 'number' },
+        maxLead: { type: 'number' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['enabled', 'gain', 'tau', 'delay', 'blend', 'maxLead']
+    }
+  },
+  {
+    name: 'temperature_set_deadband',
+    description: 'Set shared PID deadband.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deadband: { type: 'number' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['deadband']
+    }
+  },
+  {
+    name: 'temperature_set_fine_enable',
+    description: 'Enable or disable FINE condition entry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['enabled']
+    }
+  }
+]
+
+function mcpTextResult(value) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+      }
+    ]
+  }
+}
+
+async function handleMcpRequest(message) {
+  const id = message?.id ?? null
+  const method = message?.method
+
+  try {
+    if (method === 'initialize') {
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'temperature-control', version: '1.0.0' }
+        }
+      }
+    }
+
+    if (method === 'tools/list') {
+      return { jsonrpc: '2.0', id, result: { tools: mcpTools } }
+    }
+
+    if (method === 'tools/call') {
+      const toolName = message?.params?.name
+      const args = message?.params?.arguments || {}
+      const toolActions = {
+        temperature_get_status: null,
+        temperature_refresh_snapshot: 'refresh_snapshot',
+        temperature_set_mode: 'set_mode',
+        temperature_set_manual_pwm: 'set_manual_pwm',
+        temperature_set_target_temperature: 'set_target_temperature',
+        temperature_set_tran_pid: 'set_tran_pid',
+        temperature_set_fine_pid: 'set_fine_pid',
+        temperature_set_smith: 'set_smith',
+        temperature_set_deadband: 'set_deadband',
+        temperature_set_fine_enable: 'set_fine_enable'
+      }
+
+      if (!(toolName in toolActions)) {
+        throw new Error(`Unknown tool: ${toolName}`)
+      }
+
+      const result = toolActions[toolName]
+        ? await invokeExternalRendererAction(toolActions[toolName], args)
+        : { snapshot: latestExternalSnapshot }
+
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: mcpTextResult({ ok: true, result, snapshot: latestExternalSnapshot })
+      }
+    }
+
+    if (method === 'notifications/initialized') {
+      return { jsonrpc: '2.0', id, result: {} }
+    }
+
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` }
+    }
+  } catch (error) {
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32000, message: error.message || 'MCP request failed' }
+    }
+  }
+}
+
+function startExternalHttpServer() {
+  if (externalHttpServer) {
+    return
+  }
+
+  externalHttpServer = http.createServer((request, response) => {
+    handleExternalApiRequest(request, response).catch((error) => {
+      setJsonResponse(response, 500, { ok: false, error: error.message || 'HTTP service failed' })
+    })
+  })
+
+  externalHttpServer.on('error', (error) => {
+    externalServiceStatus.http.running = false
+    externalServiceStatus.http.error = error.message
+    externalServiceStatus.mcp.running = false
+    externalServiceStatus.mcp.error = error.message
+    updateExternalServiceStatus()
+  })
+
+  externalHttpServer.listen(8056, '127.0.0.1', () => {
+    externalServiceStatus.http.running = true
+    externalServiceStatus.http.error = ''
+    externalServiceStatus.mcp.running = true
+    externalServiceStatus.mcp.error = ''
+    updateExternalServiceStatus()
+  })
+}
+
+function startExternalWebSocketServer() {
+  if (externalWsHttpServer) {
+    return
+  }
+
+  externalWsHttpServer = http.createServer()
+  externalWsServer = new WebSocketServer({ server: externalWsHttpServer })
+
+  externalWsServer.on('connection', (socket) => {
+    externalWsClients.add(socket)
+    externalServiceStatus.websocket.clients = externalWsClients.size
+    updateExternalServiceStatus()
+    socket.send(JSON.stringify({ type: 'service_status', payload: externalServiceStatus, timestamp: Date.now() }))
+    socket.send(JSON.stringify({ type: 'snapshot', payload: latestExternalSnapshot, timestamp: Date.now() }))
+
+    socket.on('message', async (raw) => {
+      try {
+        const message = JSON.parse(raw.toString())
+        if (!message?.action) {
+          return
+        }
+        const result = await invokeExternalRendererAction(message.action, message.payload || {})
+        socket.send(JSON.stringify({ type: 'action_result', id: message.id, ok: true, result, timestamp: Date.now() }))
+      } catch (error) {
+        socket.send(JSON.stringify({ type: 'action_result', ok: false, error: error.message || 'Action failed', timestamp: Date.now() }))
+      }
+    })
+
+    socket.on('close', () => {
+      externalWsClients.delete(socket)
+      externalServiceStatus.websocket.clients = externalWsClients.size
+      updateExternalServiceStatus()
+    })
+  })
+
+  externalWsHttpServer.on('error', (error) => {
+    externalServiceStatus.websocket.running = false
+    externalServiceStatus.websocket.error = error.message
+    updateExternalServiceStatus()
+  })
+
+  externalWsHttpServer.listen(8057, '127.0.0.1', () => {
+    externalServiceStatus.websocket.running = true
+    externalServiceStatus.websocket.error = ''
+    updateExternalServiceStatus()
+  })
+}
+
+function startExternalServices() {
+  startExternalHttpServer()
+  startExternalWebSocketServer()
+}
+
+function stopExternalServices() {
+  for (const client of externalWsClients) {
+    client.close()
+  }
+  externalWsClients.clear()
+  externalWsServer?.close()
+  externalWsHttpServer?.close()
+  externalHttpServer?.close()
+  externalWsServer = null
+  externalWsHttpServer = null
+  externalHttpServer = null
 }
 
 function decodeDataScopeFrame(frame) {
@@ -1257,6 +1849,41 @@ ipcMain.handle('device:append-channel-samples', async (_, payload) => {
   return appendChannelSamples(channel, rows, directory, sessionId)
 })
 
+ipcMain.handle('external:update-snapshot', async (_, snapshot) => {
+  latestExternalSnapshot = {
+    ...snapshot,
+    exportedAt: Date.now()
+  }
+  externalServiceStatus.renderer.ready = true
+  externalServiceStatus.renderer.lastSnapshotAt = latestExternalSnapshot.exportedAt
+  updateExternalServiceStatus()
+  broadcastExternalWs({
+    type: 'snapshot',
+    payload: latestExternalSnapshot,
+    timestamp: Date.now()
+  })
+  return { ok: true }
+})
+
+ipcMain.handle('external:get-service-status', async () => externalServiceStatus)
+
+ipcMain.on('external:control-response', (_, message) => {
+  const waiter = externalControlWaiters.get(message?.id)
+  if (!waiter) {
+    return
+  }
+
+  clearTimeout(waiter.timer)
+  externalControlWaiters.delete(message.id)
+
+  if (message.ok) {
+    waiter.resolve(message.result)
+    return
+  }
+
+  waiter.reject(new Error(message.error || 'External control request failed'))
+})
+
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().size
   // Create the browser window.
@@ -1314,6 +1941,7 @@ app.whenReady().then(() => {
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
 
+  startExternalServices()
   createWindow()
 
   app.on('activate', function () {
@@ -1327,6 +1955,7 @@ app.whenReady().then(() => {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
+  stopExternalServices()
   closeTcpConnection()
   closeSerialConnection().catch(() => {})
   if (process.platform !== 'darwin') {

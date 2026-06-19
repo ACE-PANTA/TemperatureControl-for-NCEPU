@@ -29,6 +29,22 @@
 - serialport
 - electron-builder
 
+## 外部集成接口
+
+系统启动后会在本机开放：
+
+- HTTP + MCP: `http://127.0.0.1:8056`
+- WebSocket: `ws://127.0.0.1:8057`
+
+外部软件可以查询当前手/自动模式、当前工况、实时采样、TRAN/FINE PID 参数、死区和微调开关，也可以下发模式、PWM、目标温度和 PID 配置。
+
+外部接口文档：
+
+- 总览与调用说明：[docs/external-api.md](docs/external-api.md)
+- 快速接入示例：[docs/integration-quickstart.md](docs/integration-quickstart.md)
+- HTTP/OpenAPI 规范：[docs/openapi.yaml](docs/openapi.yaml)
+- MCP 工具清单：[docs/mcp-tools.json](docs/mcp-tools.json)
+
 ## 运行环境
 
 建议环境如下：
@@ -191,18 +207,39 @@ Where:
 | `manual_pwm` | 0 | -100~100 | Manual PWM value |
 | `step_value` | 1 | 1/5/10 | Key step amount |
 
-### B. Incremental PID
+### B. 变温工况 — 位置式 PID（主力）
+
+位置式 PID 直接输出，靠积分分离防饱和。
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
-| `pid_kp` | 3.0 | 0.1~50 | Kp: error trend gain |
-| `pid_ki` | 0.3 | 0~5 | Ki: persistent error driver |
-| `pid_kd` | 1.0 | 0~10 | Kd: damping, anti-overshoot |
-| `pid_interval` | 5 | 1~60 sec | PID adjust interval (>= system dead time) |
-| `pid_deadband` | 0.3 | 0.1~2.0 °C | Deadband: output frozen within this error |
-| `pid_max_delta` | 8.0 | 1~30 % | Max output change per PID step |
+| `tran_kp` | 3.0 | 0.1~50 | Proportional gain |
+| `tran_ki` | 0.3 | 0~5 | Integral gain (eliminates steady-state error) |
+| `tran_kd` | 1.0 | 0~10 | Derivative gain (damping, anti-overshoot) |
+| `tran_interval` | 3 | 1~60 sec | Adjust interval |
+| `tran_sep_threshold` | 10.0 | 1~50 °C | Integral separation threshold (|error|>threshold → Ki off) |
 
-### C. Network
+### C. 微调工况 — 增量式 PID
+
+进入条件：系统稳定 + `fine_entry_min ≤ |error| ≤ fine_entry_max`
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `fine_kp` | 1.5 | 0.1~20 | Proportional gain (more conservative) |
+| `fine_ki` | 0.1 | 0~3 | Integral gain |
+| `fine_kd` | 2.0 | 0~10 | Derivative gain (stronger damping) |
+| `fine_interval` | 8 | 1~60 sec | Adjust interval (slower, wait for system response) |
+| `fine_range` | 5.0 | 1~20 % | Max output change per step (tighter) |
+| `fine_entry_min` | 1.0 | 0.1~10 °C | Min \|error\| to enter fine mode |
+| `fine_entry_max` | 3.0 | 0.5~20 °C | Max \|error\| to enter fine mode |
+
+### D. 共享
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `pid_deadband` | 0.3 | 0.1~2.0 °C | Deadband width (shared by TRAN and FINE) |
+
+### E. Network
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -251,10 +288,15 @@ Reply:   !ACK=OK\r\n            (success)
 
 | Command | Example | Description |
 |---|---|---|
-| `PID=3.0,0.3,1.0` | `!PID=3.0,0.3,1.0\r\n` | Set Kp, Ki, Kd |
-| `PID=3.0,0.3,1.0,5` | +interval | Also set pid_interval |
-| `PID=3.0,0.3,1.0,5,0.3` | +deadband | Also set deadband |
-| `PID=3.0,0.3,1.0,5,0.3,8.0` | Full | Set all 6 params |
+| `TRAN=3.0,0.3,1.0` | `!TRAN=3.0,0.3,1.0\r\n` | Set Kp, Ki, Kd |
+| `TRAN=3.0,0.3,1.0,3` | +interval | Also set interval |
+| `TRAN=3.0,0.3,1.0,3,10` | +sep_threshold | Set all 5 params |
+| `FINE=1.5,0.1,2.0` | `!FINE=1.5,0.1,2.0\r\n` | Set Kp, Ki, Kd |
+| `FINE=1.5,0.1,2.0,8` | +interval | Also set interval |
+| `FINE=1.5,0.1,2.0,8,5` | +range | Also set range |
+| `FINE=1.5,0.1,2.0,8,5,1.0,3.0` | All 7 params | Set all (last 2 = entry_min, entry_max) |
+| `FINEEN=1` | `!FINEEN=1\r\n` | Enable fine tuning condition; `0` keeps auto control in TRAN |
+| `DEADBAND=0.3` | `!DEADBAND=0.3\r\n` | Set deadband width (°C) |
 
 #### Network (reboot required after change)
 
@@ -268,7 +310,10 @@ Reply:   !ACK=OK\r\n            (success)
 | Command | Reply Example |
 |---|---|
 | `GET=STATE` | `STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575` |
-| `GET=PID` | `PID=KP:3.00,KI:0.300,KD:1.00,INT:5,DB:0.30,MD:8.0` |
+| `GET=TRAN` | `TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3,ST:10.0` |
+| `GET=FINE` | `FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0,EMN:1.0,EMX:3.0` |
+| `GET=FINEEN` | `FINEEN=1` |
+| `GET=DEADBAND` | `DEADBAND=0.30` |
 | `GET=NET` | `NET=IP:192.168.1.100,GW:192.168.1.1,NM:255.255.255.0,PORT:8000` |
 | `GET=ETH` | `ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0` |
 | `GET=CONFIG` | All config parameters (multi-line) |
@@ -299,20 +344,32 @@ STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575
 | GOAL | Target ×10 | e.g. 580 = 58.0°C |
 | FB | Feedback ×10 | e.g. 575 = 57.5°C |
 
-### PID (`GET=PID`)
+### TRAN (`GET=TRAN`) — 变温工况
 
 ```
-PID=KP:3.00,KI:0.300,KD:1.00,INT:5,DB:0.30,MD:8.0
+TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3
 ```
 
 | Field | Meaning | Description |
 |---|---|---|
-| KP | pid_kp | Proportional gain |
-| KI | pid_ki | Integral gain |
-| KD | pid_kd | Derivative gain |
-| INT | pid_interval | Adjust interval (seconds) |
-| DB | pid_deadband | Deadband (°C) |
-| MD | pid_max_delta | Max output change per step (%) |
+| KP | tran_kp | Proportional gain |
+| KI | tran_ki | Integral gain |
+| KD | tran_kd | Derivative gain |
+| INT | tran_interval | Adjust interval (seconds) |
+
+### FINE (`GET=FINE`) — 微调工况
+
+```
+FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| KP | fine_kp | Proportional gain (conservative) |
+| KI | fine_ki | Integral gain |
+| KD | fine_kd | Derivative gain (strong damping) |
+| INT | fine_interval | Adjust interval (seconds, slower) |
+| RNG | fine_range | Max output change per step (%, tighter) |
 
 ### ETH Diagnostics (`GET=ETH`)
 
@@ -360,19 +417,20 @@ ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0
 ### Tuning Guide
 
 ```
-1. Set the dead time:
-   PID=3.0,0.3,1.0,5        (5s interval for slow thermal systems)
-   Increase pid_interval for larger thermal mass (e.g. 10, 15, 20)
+1. TRAN (变温工况 — 位置式 PID):
+   Temperature rises too slowly -> Increase tran_kp (3→5)
+   Temperature overshoots       -> Increase tran_kd (1→3)
+   Steady-state error persists  -> Increase tran_ki (0.3→0.6)
+   Integral windup / PWM saturates -> Increase tran_interval (3→8) or decrease tran_ki
 
-2. Tune responsiveness:
-   Temperature rises too slowly -> Increase Kp (e.g. 3.0 -> 5.0)
-   Temperature overshoots      -> Increase Kd (e.g. 1.0 -> 3.0)
-   Steady-state error persists -> Increase Ki (e.g. 0.3 -> 0.6)
-   PWM oscillates wildly       -> Decrease pid_max_delta (e.g. 8.0 -> 4.0)
+2. FINE (微调工况 — 增量式 PID):
+   Small oscillations near target -> Decrease fine_kp (1.5→0.8), increase fine_kd (2→4)
+   Convergence too slow           -> Increase fine_ki (0.1→0.3)
+   PWM jumps too often            -> Increase fine_interval (8→15) or decrease fine_range (5→3)
 
-3. Set deadband:
-   Small oscillations near target -> Increase pid_deadband (e.g. 0.3 -> 0.5)
-   Temperature stays off by 0.5°C -> Decrease pid_deadband (e.g. 0.3 -> 0.1)
+3. DEADBAND (共享死区):
+   Small oscillations near target -> Increase (0.3→0.5)
+   Temperature stays off by ~0.5°C -> Decrease (0.3→0.1)
 
 4. Save:
    SAVE
@@ -424,11 +482,12 @@ FWLIB/                STM32F4 StdPeriph Library
 
 | Symptom | Likely Cause | Fix |
 |---|---|---|
-| Temp stuck below target | Ki too weak / max_delta too small | Increase Ki (0.3→0.6) or max_delta (8→12) |
-| Large overshoot | Kp too high / Kd too low / interval too short | Decrease Kp, increase Kd, increase pid_interval |
-| PWM oscillates (0→100→0) | max_delta too large / interval too short | Decrease max_delta (8→4), increase interval (5→10) |
-| Steady oscillation near target | Deadband too small | Increase pid_deadband (0.3→0.5) |
-| No response to errors | pid_interval too long | Decrease pid_interval |
+| Temp stuck below target | TRAN Ki too weak | Increase tran_ki (0.3→0.6) |
+| Large overshoot on heat-up | TRAN Kp too high / Kd too low | Decrease tran_kp (5→3), increase tran_kd (1→3) |
+| PWM oscillates or saturates | TRAN Ki windup / interval too short | Increase tran_interval (3→8), decrease tran_ki |
+| Oscillation near target | FINE Kp too high / Kd too low | Decrease fine_kp (1.5→0.8), increase fine_kd (2→4) |
+| Slow convergence near target | FINE Ki too weak / interval too long | Increase fine_ki (0.1→0.3), decrease fine_interval (15→8) |
+| Steady oscillation ±0.3°C | Deadband too small | Increase pid_deadband (0.3→0.5) |
 | Network not connecting | IP mismatch / hardware | Use UART `GET=ETH` for diagnostics |
 | Flash save fails | Sector erase error | Check FLASH_Sector_7 not occupied |
 

@@ -22,8 +22,6 @@ const {
   selectedSerialPath,
   selectedEthernetHost,
   selectedAdapterName,
-  activeSerialLabel,
-  activeEthernetLabel,
   serialConfig,
   ethernetConfig,
   eventTimeline,
@@ -33,13 +31,12 @@ const {
 
 const {
   chartPanOffset,
-  curvePoints,
   visibleCurveSamples,
   currentTemp,
   targetTemp,
   furnaceState,
-  primarySample,
   controllerState,
+  externalServiceStatus,
   logDirectory,
   visiblePointCount,
   xAxisLabels,
@@ -119,6 +116,50 @@ const targetTempText = computed(() => (hasTargetTemp.value ? `${targetTemp.value
 const controllerModeLabel = computed(() => {
   if (controllerState.value.mode === 'AUTO') {
     return '自动模式';
+  }
+
+  if (controllerState.value.mode === 'MAN') {
+    return '手动模式';
+  }
+
+  return '模式未同步';
+});
+const externalServiceLabel = computed(() => {
+  const httpOk = externalServiceStatus.value.http?.running;
+  const wsOk = externalServiceStatus.value.websocket?.running;
+  const mcpOk = externalServiceStatus.value.mcp?.running;
+  if (httpOk && wsOk && mcpOk) {
+    return '外部接口 8056/8057 正常';
+  }
+  const failed = [
+    httpOk ? '' : 'HTTP',
+    wsOk ? '' : 'WS',
+    mcpOk ? '' : 'MCP'
+  ].filter(Boolean).join('/');
+  return `外部接口 ${failed || '启动中'}`;
+});
+const controllerPhaseLabel = computed(() => {
+  if (controllerState.value.phase === 'MAN') {
+    return '手动';
+  }
+
+  if (controllerState.value.phase === 'TRAN') {
+    return '变温';
+  }
+
+  if (controllerState.value.phase === 'FINE') {
+    return '微调';
+  }
+
+  return '--';
+});
+const controllerModeWithPhaseLabel = computed(() => {
+  if (controllerState.value.mode === 'AUTO') {
+    return controllerState.value.phase === 'TRAN'
+      ? '自动模式 · 变温工况'
+      : controllerState.value.phase === 'FINE'
+        ? '自动模式 · 微调工况'
+        : '自动模式';
   }
 
   if (controllerState.value.mode === 'MAN') {
@@ -384,8 +425,6 @@ const chartGridLines = computed(() => {
     };
   });
 });
-
-const chartPath = computed(() => temperatureSeries.value?.path || '');
 
 const areaPath = computed(() => {
   const series = temperatureSeries.value;
@@ -659,8 +698,10 @@ onMounted(async () => {
           <div class="status-cluster">
             <span class="status-pill status-pill-live">实时采集中</span>
             <span class="status-pill">主通道 {{ primaryChannel ? (primaryChannel === 'serial' ? '串口' : '网口') : '未选择' }}</span>
-            <span class="status-pill">控制模式 {{ controllerModeLabel }}</span>
+            <span class="status-pill">控制模式 {{ controllerModeWithPhaseLabel }}</span>
+            <span class="status-pill">当前工况 {{ controllerPhaseLabel }}</span>
             <span class="status-pill">记录状态 {{ recordingStatusText }}</span>
+            <span class="status-pill" :class="{ 'status-pill-live': externalServiceStatus.http?.running && externalServiceStatus.websocket?.running && externalServiceStatus.mcp?.running }">{{ externalServiceLabel }}</span>
           </div>
         </div>
 
@@ -872,6 +913,7 @@ onMounted(async () => {
               </div>
               <div class="support-note-row control-meta-row">
                 <span>当前模式：{{ controllerModeLabel }}</span>
+                <span>当前工况：{{ controllerPhaseLabel }}</span>
                 <span>当前 PWM：{{ currentPwmText }}</span>
                 <span>目标温度：{{ targetTempText }}</span>
               </div>

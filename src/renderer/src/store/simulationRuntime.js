@@ -1,8 +1,14 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import {
-  defaultPidDraft,
-  normalizePidPayload,
+  defaultTranDraft,
+  defaultFineDraft,
+  defaultSmithDraft,
+  defaultDeadband,
+  defaultFineEnabled,
+  normalizeTranPayload,
+  normalizeFinePayload,
+  normalizeSmithPayload,
   normalizeNetPayload
 } from '../services/pidSimulation.js';
 import { useDeviceRuntimeStore } from './deviceRuntime.js';
@@ -36,6 +42,28 @@ function normalizeControllerModeValue(mode) {
   }
 
   return normalizedMode || null;
+}
+
+function normalizeControllerPhaseValue(phase) {
+  const normalizedPhase = String(phase ?? '').trim().toUpperCase();
+
+  if (normalizedPhase === 'MAN' || normalizedPhase === 'TRAN' || normalizedPhase === 'FINE') {
+    return normalizedPhase;
+  }
+
+  return normalizedPhase || null;
+}
+
+function inferModeFromPhase(phase) {
+  if (phase === 'MAN') {
+    return 'MAN';
+  }
+
+  if (phase === 'TRAN' || phase === 'FINE') {
+    return 'AUTO';
+  }
+
+  return null;
 }
 
 function parseStateBodyFields(body) {
@@ -72,16 +100,21 @@ function normalizeControllerSnapshot(snapshot) {
   if (!rawFields) {
     return {
       ...snapshot,
-      mode: normalizeControllerModeValue(snapshot.mode)
+      mode: normalizeControllerModeValue(snapshot.mode),
+      phase: normalizeControllerPhaseValue(snapshot.phase)
     };
   }
 
+  const normalizedPhase = normalizeControllerPhaseValue(rawFields.PHASE ?? snapshot.phase);
+
   return {
     ...snapshot,
-    mode: normalizeControllerModeValue(rawFields.MODE ?? snapshot.mode),
+    mode: normalizeControllerModeValue(rawFields.MODE ?? snapshot.mode) || inferModeFromPhase(normalizedPhase),
+    phase: normalizedPhase,
     pwm: Number.isFinite(Number(rawFields.PWM)) ? Number(rawFields.PWM) : snapshot.pwm,
     goal: parseTenthsValue(rawFields.GOAL, snapshot.goal),
-    feedback: parseTenthsValue(rawFields.FB, snapshot.feedback)
+    feedback: parseTenthsValue(rawFields.FB, snapshot.feedback),
+    predictedFeedback: parseTenthsValue(rawFields.PFB, snapshot.predictedFeedback)
   };
 }
 
@@ -161,6 +194,9 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   const deviceStore = useDeviceRuntimeStore();
   const configStore = useSystemConfigStore();
   let controllerRefreshTimer = null;
+  let externalSnapshotTimer = null;
+  let externalControlUnsubscribe = null;
+  let externalStatusUnsubscribe = null;
 
   const currentSamples = reactive({
     serial: null,
@@ -168,9 +204,12 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   });
   const curveHistory = ref([]);
   const chartPanOffset = ref(0);
-  const latestPidDispatch = ref(null);
-  const lastAppliedPid = ref({ ...defaultPidDraft });
-  const previousAppliedPid = ref(null);
+  const latestParamDispatch = ref(null);
+  const lastAppliedTran = ref({ ...defaultTranDraft });
+  const lastAppliedFine = ref({ ...defaultFineDraft });
+  const lastAppliedSmith = ref({ ...defaultSmithDraft });
+  const lastAppliedDeadband = ref(defaultDeadband);
+  const lastAppliedFineEnabled = ref(defaultFineEnabled);
   const requestedSetpoint = ref(null);
   const runtimeStarted = ref(false);
   const serialStreamState = reactive({
@@ -217,10 +256,18 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   const ETHERNET_POLL_INTERVAL_MS = 1500;
   const controllerState = reactive({
     mode: null,
+    phase: null,
     pwm: null,
     goal: null,
     feedback: null,
+    predictedFeedback: null,
     updatedAt: null
+  });
+  const externalServiceStatus = reactive({
+    http: { port: 8056, running: false, error: '' },
+    websocket: { port: 8057, running: false, error: '', clients: 0 },
+    mcp: { port: 8056, path: '/mcp', running: false, error: '' },
+    renderer: { ready: false, lastSnapshotAt: null }
   });
   const batchBuffers = reactive({
     serial: [],
@@ -239,7 +286,17 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     sessionStartedAt: null
   });
 
-  const pidDraft = computed(() => configStore.pidDraft);
+  const tranDraft = computed(() => configStore.tranDraft);
+  const fineDraft = computed(() => configStore.fineDraft);
+  const smithDraft = computed(() => configStore.smithDraft);
+  const deadband = computed({
+    get: () => configStore.deadband,
+    set: (val) => { configStore.deadband = val }
+  });
+  const fineEnabled = computed({
+    get: () => configStore.fineEnabled,
+    set: (val) => { configStore.fineEnabled = Boolean(val) }
+  });
   const netDraft = computed(() => configStore.netDraft);
   const plantDraft = computed(() => configStore.plantDraft);
   const logDirectory = computed(() => configStore.settings.logDirectory);
@@ -382,9 +439,11 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     const normalizedSnapshot = normalizeControllerSnapshot(snapshot);
 
     controllerState.mode = normalizedSnapshot.mode || controllerState.mode;
+    controllerState.phase = normalizedSnapshot.phase || controllerState.phase;
     controllerState.pwm = Number.isFinite(normalizedSnapshot.pwm) ? normalizedSnapshot.pwm : controllerState.pwm;
     controllerState.goal = Number.isFinite(normalizedSnapshot.goal) ? normalizedSnapshot.goal : controllerState.goal;
     controllerState.feedback = Number.isFinite(normalizedSnapshot.feedback) ? normalizedSnapshot.feedback : controllerState.feedback;
+    controllerState.predictedFeedback = Number.isFinite(normalizedSnapshot.predictedFeedback) ? normalizedSnapshot.predictedFeedback : controllerState.predictedFeedback;
     controllerState.updatedAt = Date.now();
 
     if (Number.isFinite(normalizedSnapshot.goal)) {
@@ -402,20 +461,87 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  function applyQueriedPid(snapshot) {
+  function applyControllerPhase(snapshot) {
+    const phase = normalizeControllerPhaseValue(snapshot?.phase);
+    if (!phase) {
+      return;
+    }
+
+    controllerState.phase = phase;
+    controllerState.mode = inferModeFromPhase(phase) || controllerState.mode;
+    controllerState.updatedAt = Date.now();
+  }
+
+  function applyQueriedTran(snapshot) {
     if (!Number.isFinite(snapshot.kp) || !Number.isFinite(snapshot.ki) || !Number.isFinite(snapshot.kd)) {
       return;
     }
 
-    const normalizedPid = normalizePidPayload({
-      ...configStore.pidDraft,
+    const normalized = normalizeTranPayload({
       kp: snapshot.kp,
       ki: snapshot.ki,
-      kd: snapshot.kd
+      kd: snapshot.kd,
+      interval: Number.isFinite(snapshot.interval) ? snapshot.interval : undefined,
+      sepThreshold: Number.isFinite(snapshot.sepThreshold) ? snapshot.sepThreshold : undefined
     });
 
-    Object.assign(configStore.pidDraft, normalizedPid);
-    lastAppliedPid.value = { ...normalizedPid };
+    Object.assign(configStore.tranDraft, normalized);
+    lastAppliedTran.value = { ...normalized };
+  }
+
+  function applyQueriedFine(snapshot) {
+    if (!Number.isFinite(snapshot.kp) || !Number.isFinite(snapshot.ki) || !Number.isFinite(snapshot.kd)) {
+      return;
+    }
+
+    const normalized = normalizeFinePayload({
+      kp: snapshot.kp,
+      ki: snapshot.ki,
+      kd: snapshot.kd,
+      interval: Number.isFinite(snapshot.interval) ? snapshot.interval : undefined,
+      range: Number.isFinite(snapshot.range) ? snapshot.range : undefined,
+      entryMin: Number.isFinite(snapshot.entryMin) ? snapshot.entryMin : undefined,
+      entryMax: Number.isFinite(snapshot.entryMax) ? snapshot.entryMax : undefined,
+      stableWindow: Number.isFinite(snapshot.stableWindow) ? snapshot.stableWindow : undefined,
+      stableDelta: Number.isFinite(snapshot.stableDelta) ? snapshot.stableDelta : undefined
+    });
+
+    Object.assign(configStore.fineDraft, normalized);
+    lastAppliedFine.value = { ...normalized };
+  }
+
+  function applyQueriedSmith(snapshot) {
+    if (!Number.isFinite(snapshot.gain) || !Number.isFinite(snapshot.tau) || !Number.isFinite(snapshot.delay)) {
+      return;
+    }
+
+    const normalized = normalizeSmithPayload({
+      enabled: typeof snapshot.enabled === 'boolean' ? snapshot.enabled : undefined,
+      gain: snapshot.gain,
+      tau: snapshot.tau,
+      delay: snapshot.delay,
+      blend: Number.isFinite(snapshot.blend) ? snapshot.blend : undefined,
+      maxLead: Number.isFinite(snapshot.maxLead) ? snapshot.maxLead : undefined
+    });
+
+    Object.assign(configStore.smithDraft, normalized);
+    lastAppliedSmith.value = { ...normalized };
+  }
+
+  function applyQueriedDeadband(snapshot) {
+    if (!Number.isFinite(snapshot.deadband)) {
+      return;
+    }
+    configStore.deadband = snapshot.deadband;
+    lastAppliedDeadband.value = snapshot.deadband;
+  }
+
+  function applyQueriedFineEnable(snapshot) {
+    if (typeof snapshot.enabled !== 'boolean') {
+      return;
+    }
+    configStore.fineEnabled = snapshot.enabled;
+    lastAppliedFineEnabled.value = snapshot.enabled;
   }
 
   function handleSerialProtocolMessage(payload) {
@@ -442,8 +568,41 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return;
     }
 
+    if (payload.kind === 'phase') {
+      applyControllerPhase(payload);
+      return;
+    }
+
+    if (payload.kind === 'tran') {
+      applyQueriedTran(payload);
+    }
+
+    if (payload.kind === 'fine') {
+      applyQueriedFine(payload);
+    }
+
+    if (payload.kind === 'deadband') {
+      applyQueriedDeadband(payload);
+    }
+
+    if (payload.kind === 'fineEnable') {
+      applyQueriedFineEnable(payload);
+    }
+
+    if (payload.kind === 'smith') {
+      applyQueriedSmith(payload);
+    }
+
+    if (payload.kind === 'smithEnable') {
+      configStore.smithDraft.enabled = Boolean(payload.enabled);
+      lastAppliedSmith.value = {
+        ...lastAppliedSmith.value,
+        enabled: Boolean(payload.enabled)
+      };
+    }
+
     if (payload.kind === 'pid') {
-      applyQueriedPid(payload);
+      // legacy PID — ignored
     }
 
     if (payload.kind === 'net') {
@@ -502,8 +661,41 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return;
     }
 
+    if (payload.kind === 'phase') {
+      applyControllerPhase(payload);
+      return;
+    }
+
+    if (payload.kind === 'tran') {
+      applyQueriedTran(payload);
+    }
+
+    if (payload.kind === 'fine') {
+      applyQueriedFine(payload);
+    }
+
+    if (payload.kind === 'deadband') {
+      applyQueriedDeadband(payload);
+    }
+
+    if (payload.kind === 'fineEnable') {
+      applyQueriedFineEnable(payload);
+    }
+
+    if (payload.kind === 'smith') {
+      applyQueriedSmith(payload);
+    }
+
+    if (payload.kind === 'smithEnable') {
+      configStore.smithDraft.enabled = Boolean(payload.enabled);
+      lastAppliedSmith.value = {
+        ...lastAppliedSmith.value,
+        enabled: Boolean(payload.enabled)
+      };
+    }
+
     if (payload.kind === 'pid') {
-      applyQueriedPid(payload);
+      // legacy PID — ignored
     }
 
     if (payload.kind === 'net') {
@@ -540,9 +732,22 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       overshootPercent: Number(currentSamples.ethernet?.overshootPercent || 0),
       settlingTime: currentSamples.ethernet?.settlingTime ?? null,
       mode: payload.mode || controllerState.mode || 'ethernet-live',
-      kp: Number(lastAppliedPid.value.kp),
-      ki: Number(lastAppliedPid.value.ki),
-      kd: Number(lastAppliedPid.value.kd),
+      tranKp: Number(lastAppliedTran.value.kp),
+      tranKi: Number(lastAppliedTran.value.ki),
+      tranKd: Number(lastAppliedTran.value.kd),
+      tranInterval: Number(lastAppliedTran.value.interval),
+      tranSepThreshold: Number(lastAppliedTran.value.sepThreshold),
+      fineKp: Number(lastAppliedFine.value.kp),
+      fineKi: Number(lastAppliedFine.value.ki),
+      fineKd: Number(lastAppliedFine.value.kd),
+      fineInterval: Number(lastAppliedFine.value.interval),
+      fineRange: Number(lastAppliedFine.value.range),
+      fineEntryMin: Number(lastAppliedFine.value.entryMin),
+      fineEntryMax: Number(lastAppliedFine.value.entryMax),
+      fineStableWindow: Number(lastAppliedFine.value.stableWindow),
+      fineStableDelta: Number(lastAppliedFine.value.stableDelta),
+      fineEnabled: lastAppliedFineEnabled.value ? 1 : 0,
+      deadband: Number(lastAppliedDeadband.value),
       xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
       boardTemperature: 0,
       telemetry: [],
@@ -703,22 +908,90 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function refreshPidParameters({ silent = false, channel = null } = {}) {
+  async function refreshTranParams({ silent = false, channel = null } = {}) {
     try {
-      const response = await sendChannelCommand('GET=PID', 'pid', 'PID 查询', channel);
+      const response = await sendChannelCommand('GET=TRAN', 'tran', '变温参数查询', channel);
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'success', title: '变温参数已同步', message: '已读取设备内当前变温工况参数。' });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '变温参数查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`变温参数查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshFineParams({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=FINE', 'fine', '微调参数查询', channel);
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'success', title: '微调参数已同步', message: '已读取设备内当前微调工况参数。' });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '微调参数查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`微调参数查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshDeadband({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=DEADBAND', 'deadband', '死区查询', channel);
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'success', title: '死区已同步', message: '已读取设备内当前死区值。' });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: '死区查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`死区查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshFineEnable({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=FINEEN', 'fineEnable', '微调开关查询', channel);
       if (!silent) {
         deviceStore.pushAlert({
           tone: 'success',
-          title: 'PID 已同步',
-          message: '已读取设备内当前 PID 参数。'
+          title: '微调开关已同步',
+          message: `设备当前${configStore.fineEnabled ? '允许' : '禁止'}进入微调工况。`
         });
       }
       return response;
     } catch (error) {
       if (!silent) {
-        deviceStore.pushAlert({ tone: 'danger', title: 'PID 查询失败', message: error.message || '未知错误' });
+        deviceStore.pushAlert({ tone: 'danger', title: '微调开关查询失败', message: error.message || '未知错误' });
       }
-      deviceStore.appendEvent(`PID 查询失败：${error.message}`);
+      deviceStore.appendEvent(`微调开关查询失败：${error.message}`);
+      return null;
+    }
+  }
+
+  async function refreshSmithParams({ silent = false, channel = null } = {}) {
+    try {
+      const response = await sendChannelCommand('GET=SMITH', 'smith', 'Smith 参数查询', channel);
+      if (!silent) {
+        deviceStore.pushAlert({
+          tone: 'success',
+          title: 'Smith 参数已同步',
+          message: `设备当前${configStore.smithDraft.enabled ? '启用' : '关闭'} Smith 预估控制。`
+        });
+      }
+      return response;
+    } catch (error) {
+      if (!silent) {
+        deviceStore.pushAlert({ tone: 'danger', title: 'Smith 参数查询失败', message: error.message || '未知错误' });
+      }
+      deviceStore.appendEvent(`Smith 参数查询失败：${error.message}`);
       return null;
     }
   }
@@ -775,9 +1048,13 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function refreshControllerSnapshot({ silent = false } = {}) {
-    await refreshControllerState({ silent });
-    await refreshPidParameters({ silent });
+  async function refreshControllerSnapshot({ silent = false, channel = null } = {}) {
+    await refreshControllerState({ silent, channel });
+    await refreshTranParams({ silent, channel });
+    await refreshFineParams({ silent, channel });
+    await refreshFineEnable({ silent, channel });
+    await refreshSmithParams({ silent, channel });
+    await refreshDeadband({ silent, channel });
   }
 
   function scheduleControllerStateRefresh(delayMs = 450) {
@@ -920,9 +1197,22 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       overshootPercent: Number(toNumeric(currentSamples.serial?.overshootPercent, 0).toFixed(2)),
       settlingTime: currentSamples.serial?.settlingTime ?? null,
       mode: controllerState.mode || 'serial-live',
-      kp: Number(lastAppliedPid.value.kp),
-      ki: Number(lastAppliedPid.value.ki),
-      kd: Number(lastAppliedPid.value.kd),
+      tranKp: Number(lastAppliedTran.value.kp),
+      tranKi: Number(lastAppliedTran.value.ki),
+      tranKd: Number(lastAppliedTran.value.kd),
+      tranInterval: Number(lastAppliedTran.value.interval),
+      tranSepThreshold: Number(lastAppliedTran.value.sepThreshold),
+      fineKp: Number(lastAppliedFine.value.kp),
+      fineKi: Number(lastAppliedFine.value.ki),
+      fineKd: Number(lastAppliedFine.value.kd),
+      fineInterval: Number(lastAppliedFine.value.interval),
+      fineRange: Number(lastAppliedFine.value.range),
+      fineEntryMin: Number(lastAppliedFine.value.entryMin),
+      fineEntryMax: Number(lastAppliedFine.value.entryMax),
+      fineStableWindow: Number(lastAppliedFine.value.stableWindow),
+      fineStableDelta: Number(lastAppliedFine.value.stableDelta),
+      fineEnabled: lastAppliedFineEnabled.value ? 1 : 0,
+      deadband: Number(lastAppliedDeadband.value),
       xAxisSecondsPerDivision: Number(configStore.settings.xAxisSecondsPerDivision),
       boardTemperature: Number(toNumeric(payload.boardTemp, 0).toFixed(2)),
       telemetry: Array.isArray(payload.telemetry) ? payload.telemetry : []
@@ -956,6 +1246,204 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
   function hasActiveConnection() {
     return deviceStore.serialConnected || deviceStore.ethernetConnected;
+  }
+
+  function toPlain(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function withoutChannel(payload) {
+    const result = { ...(payload || {}) };
+    delete result.channel;
+    return result;
+  }
+
+  function buildExternalSnapshot() {
+    return {
+      version: 1,
+      timestamp: Date.now(),
+      connection: {
+        primaryChannel: deviceStore.primaryChannel,
+        serial: {
+          connected: deviceStore.serialConnected,
+          label: deviceStore.activeSerialLabel
+        },
+        ethernet: {
+          connected: deviceStore.ethernetConnected,
+          label: deviceStore.activeEthernetLabel
+        }
+      },
+      controller: {
+        mode: controllerState.mode,
+        phase: controllerState.phase,
+        pwm: controllerState.pwm,
+        targetTemperature: targetTemp.value,
+        feedbackTemperature: currentTemp.value,
+        predictedFeedbackTemperature: controllerState.predictedFeedback,
+        updatedAt: controllerState.updatedAt
+      },
+      pid: {
+        tran: toPlain(configStore.tranDraft),
+        fine: toPlain(configStore.fineDraft),
+        smith: toPlain(configStore.smithDraft),
+        deadband: configStore.deadband,
+        fineEnabled: configStore.fineEnabled,
+        lastApplied: {
+          tran: toPlain(lastAppliedTran.value),
+          fine: toPlain(lastAppliedFine.value),
+          smith: toPlain(lastAppliedSmith.value),
+          deadband: lastAppliedDeadband.value,
+          fineEnabled: lastAppliedFineEnabled.value
+        },
+        latestDispatch: latestParamDispatch.value ? toPlain(latestParamDispatch.value) : null
+      },
+      sample: {
+        serial: currentSamples.serial ? toPlain(currentSamples.serial) : null,
+        ethernet: currentSamples.ethernet ? toPlain(currentSamples.ethernet) : null,
+        primary: primarySample.value ? toPlain(primarySample.value) : null
+      },
+      recording: toPlain(recordingState),
+      services: toPlain(externalServiceStatus)
+    };
+  }
+
+  async function publishExternalSnapshot() {
+    if (!deviceApi?.updateExternalSnapshot) {
+      return;
+    }
+
+    try {
+      await deviceApi.updateExternalSnapshot(buildExternalSnapshot());
+    } catch (error) {
+      deviceStore.appendEvent(`External snapshot update failed: ${error.message}`);
+    }
+  }
+
+  function scheduleExternalSnapshotPublish(delayMs = 80) {
+    if (externalSnapshotTimer) {
+      window.clearTimeout(externalSnapshotTimer);
+    }
+
+    externalSnapshotTimer = window.setTimeout(() => {
+      externalSnapshotTimer = null;
+      publishExternalSnapshot();
+    }, delayMs);
+  }
+
+  function applyExternalStatus(status) {
+    if (!status) {
+      return;
+    }
+    Object.assign(externalServiceStatus.http, status.http || {});
+    Object.assign(externalServiceStatus.websocket, status.websocket || {});
+    Object.assign(externalServiceStatus.mcp, status.mcp || {});
+    Object.assign(externalServiceStatus.renderer, status.renderer || {});
+  }
+
+  async function initializeExternalIntegration() {
+    if (deviceApi?.getExternalServiceStatus) {
+      try {
+        applyExternalStatus(await deviceApi.getExternalServiceStatus());
+      } catch (error) {
+        deviceStore.appendEvent(`External service status read failed: ${error.message}`);
+      }
+    }
+
+    if (deviceApi?.onExternalServiceStatus && !externalStatusUnsubscribe) {
+      externalStatusUnsubscribe = deviceApi.onExternalServiceStatus((status) => {
+        applyExternalStatus(status);
+      });
+    }
+
+    if (deviceApi?.onExternalControlRequest && !externalControlUnsubscribe) {
+      externalControlUnsubscribe = deviceApi.onExternalControlRequest(async (request) => {
+        const result = await handleExternalControlAction(request.action, request.payload || {});
+        scheduleExternalSnapshotPublish(0);
+        return result;
+      });
+    }
+
+    scheduleExternalSnapshotPublish(0);
+  }
+
+  async function handleExternalControlAction(action, payload) {
+    const channel = payload.channel || null;
+
+    if (action === 'refresh_snapshot') {
+      await refreshControllerSnapshot({ silent: true, channel });
+      return { applied: true, snapshot: buildExternalSnapshot() };
+    }
+
+    if (action === 'set_mode') {
+      const applied = await setControllerMode(payload.mode, channel);
+      if (!applied) throw new Error('Mode switch failed');
+      return { applied, mode: String(payload.mode || '').toUpperCase(), channel: resolveChannel(channel) };
+    }
+
+    if (action === 'set_manual_pwm') {
+      const applied = await applyManualPwm(payload.pwm, channel);
+      if (!applied) throw new Error('Manual PWM update failed');
+      return { applied, pwm: Number(payload.pwm), channel: resolveChannel(channel) };
+    }
+
+    if (action === 'set_target_temperature') {
+      const value = payload.temperature ?? payload.targetTemperature;
+      const applied = await commitTargetTemperature(value, channel);
+      if (!applied) throw new Error('Target temperature update failed');
+      return { applied, temperature: Number(value), channel: resolveChannel(channel) };
+    }
+
+    if (action === 'set_tran_pid') {
+      Object.assign(configStore.tranDraft, {
+        ...toPlain(configStore.tranDraft),
+        ...withoutChannel(payload)
+      });
+      const result = await dispatchTranParams(channel);
+      if (!result.applied) throw new Error('TRAN PID update failed');
+      return result;
+    }
+
+    if (action === 'set_fine_pid') {
+      Object.assign(configStore.fineDraft, {
+        ...toPlain(configStore.fineDraft),
+        ...withoutChannel(payload)
+      });
+      const result = await dispatchFineParams(channel);
+      if (!result.applied) throw new Error('FINE PID update failed');
+      return result;
+    }
+
+    if (action === 'set_smith') {
+      Object.assign(configStore.smithDraft, {
+        ...toPlain(configStore.smithDraft),
+        ...withoutChannel(payload)
+      });
+      const result = await dispatchSmithParams(channel);
+      if (!result.applied) throw new Error('Smith predictor update failed');
+      return result;
+    }
+
+    if (action === 'set_deadband') {
+      configStore.deadband = Number(payload.deadband);
+      const result = await dispatchDeadband(channel);
+      if (!result.applied) throw new Error('Deadband update failed');
+      return result;
+    }
+
+    if (action === 'set_fine_enable') {
+      configStore.fineEnabled = Boolean(payload.enabled);
+      const result = await dispatchFineEnable(channel);
+      if (!result.applied) throw new Error('Fine-enable update failed');
+      return result;
+    }
+
+    if (action === 'save_config') {
+      const applied = await dispatchSaveConfig(channel);
+      if (!applied) throw new Error('Config save failed');
+      return { applied, channel: resolveChannel(channel) };
+    }
+
+    throw new Error(`Unknown external action: ${action}`);
   }
 
   async function ensureLogDirectory() {
@@ -992,9 +1480,21 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       overshootPercent: Number(row.overshootPercent),
       settlingTime: row.settlingTime ?? null,
       mode: row.mode,
-      kp: Number(row.kp),
-      ki: Number(row.ki),
-      kd: Number(row.kd),
+      tranKp: Number(row.tranKp),
+      tranKi: Number(row.tranKi),
+      tranKd: Number(row.tranKd),
+      tranInterval: Number(row.tranInterval),
+      tranSepThreshold: Number(row.tranSepThreshold),
+      fineKp: Number(row.fineKp),
+      fineKi: Number(row.fineKi),
+      fineKd: Number(row.fineKd),
+      fineInterval: Number(row.fineInterval),
+      fineRange: Number(row.fineRange),
+      fineEntryMin: Number(row.fineEntryMin),
+      fineEntryMax: Number(row.fineEntryMax),
+      fineStableWindow: Number(row.fineStableWindow),
+      fineStableDelta: Number(row.fineStableDelta),
+      deadband: Number(row.deadband),
       sampleIndex: Number(row.sampleIndex),
       xAxisSecondsPerDivision: Number(row.xAxisSecondsPerDivision)
     }));
@@ -1143,6 +1643,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     attachSerialFrameListener();
     attachSerialProtocolListener();
     attachTcpProtocolListener();
+    await initializeExternalIntegration();
     await ensureLogDirectory();
     await reconcileRecordingLifecycle();
     if (deviceStore.serialConnected) {
@@ -1163,21 +1664,41 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     detachSerialFrameListener();
     detachSerialProtocolListener();
     detachTcpProtocolListener();
+    externalControlUnsubscribe?.();
+    externalControlUnsubscribe = null;
+    externalStatusUnsubscribe?.();
+    externalStatusUnsubscribe = null;
+    if (externalSnapshotTimer) {
+      window.clearTimeout(externalSnapshotTimer);
+      externalSnapshotTimer = null;
+    }
     await Promise.all([flushChannelBatch('serial'), flushChannelBatch('ethernet')]);
   }
 
   function applyProfile(profile) {
-    configStore.pidDraft.kp = Number(profile.kp);
-    configStore.pidDraft.ki = Number(profile.ki);
-    configStore.pidDraft.kd = Number(profile.kd);
+    configStore.tranDraft.kp = Number(profile.kp);
+    configStore.tranDraft.ki = Number(profile.ki);
+    configStore.tranDraft.kd = Number(profile.kd);
   }
 
-  function resetPidDraft() {
-    Object.assign(configStore.pidDraft, defaultPidDraft);
+  function resetTranDraft() {
+    Object.assign(configStore.tranDraft, defaultTranDraft);
+  }
+
+  function resetFineDraft() {
+    Object.assign(configStore.fineDraft, defaultFineDraft);
+  }
+
+  function resetSmithDraft() {
+    Object.assign(configStore.smithDraft, defaultSmithDraft);
   }
 
   function syncDraftToChannels() {
-    lastAppliedPid.value = normalizePidPayload(configStore.pidDraft);
+    lastAppliedTran.value = normalizeTranPayload(configStore.tranDraft);
+    lastAppliedFine.value = normalizeFinePayload(configStore.fineDraft);
+    lastAppliedSmith.value = normalizeSmithPayload(configStore.smithDraft);
+    lastAppliedDeadband.value = configStore.deadband;
+    lastAppliedFineEnabled.value = configStore.fineEnabled;
   }
 
   function applyPlantDraft() {
@@ -1247,40 +1768,158 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     }
   }
 
-  async function dispatchPidParameters(channel = null) {
+  async function dispatchTranParams(channel = null) {
     const targetChannel = resolveChannel(channel);
-    const normalizedPid = normalizePidPayload(configStore.pidDraft);
-    Object.assign(configStore.pidDraft, normalizedPid);
+    const normalized = normalizeTranPayload(configStore.tranDraft);
+    Object.assign(configStore.tranDraft, normalized);
 
     try {
-      await sendChannelCommand(
-        `PID=${normalizedPid.kp.toFixed(4)},${normalizedPid.ki.toFixed(4)},${normalizedPid.kd.toFixed(4)}`,
-        'ack',
-        'PID 参数下发',
-        targetChannel
-      );
+      const cmd = `TRAN=${normalized.kp.toFixed(4)},${normalized.ki.toFixed(4)},${normalized.kd.toFixed(4)},${normalized.interval},${normalized.sepThreshold.toFixed(1)}`;
+      await sendChannelCommand(cmd, 'ack', '变温参数下发', targetChannel);
 
-      previousAppliedPid.value = { ...lastAppliedPid.value };
-      lastAppliedPid.value = { ...normalizedPid };
-      latestPidDispatch.value = {
+      lastAppliedTran.value = { ...normalized };
+      latestParamDispatch.value = {
         channel: targetChannel,
         timestamp: Date.now(),
-        payload: { ...normalizedPid }
+        kind: 'tran',
+        payload: { ...normalized }
       };
-      await refreshPidParameters({ silent: true, channel: targetChannel });
+      await refreshTranParams({ silent: true, channel: targetChannel });
       const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
       deviceStore.appendEvent(
-        `PID 参数已下发到${channelLabel}控制器：Kp ${normalizedPid.kp.toFixed(4)} / Ki ${normalizedPid.ki.toFixed(4)} / Kd ${normalizedPid.kd.toFixed(4)}`
+        `变温参数已下发到${channelLabel}：Kp ${normalized.kp.toFixed(2)} Ki ${normalized.ki.toFixed(3)} Kd ${normalized.kd.toFixed(2)} 间隔${normalized.interval}s 分离阈值${normalized.sepThreshold.toFixed(1)}°C`
+      );
+      deviceStore.pushAlert({ tone: 'success', title: '变温参数已下发', message: `已更新${channelLabel}控制器变温工况参数。` });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '变温参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`变温参数下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchFineParams(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const normalized = normalizeFinePayload(configStore.fineDraft);
+    Object.assign(configStore.fineDraft, normalized);
+
+    try {
+      const cmd = `FINE=${normalized.kp.toFixed(4)},${normalized.ki.toFixed(4)},${normalized.kd.toFixed(4)},${normalized.interval},${normalized.range.toFixed(2)},${normalized.entryMin.toFixed(2)},${normalized.entryMax.toFixed(2)},${normalized.stableWindow},${normalized.stableDelta.toFixed(2)}`;
+      await sendChannelCommand(cmd, 'ack', '微调参数下发', targetChannel);
+
+      lastAppliedFine.value = { ...normalized };
+      latestParamDispatch.value = {
+        channel: targetChannel,
+        timestamp: Date.now(),
+        kind: 'fine',
+        payload: { ...normalized }
+      };
+      await refreshFineParams({ silent: true, channel: targetChannel });
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(
+        `微调参数已下发到${channelLabel}：Kp ${normalized.kp.toFixed(2)} Ki ${normalized.ki.toFixed(3)} Kd ${normalized.kd.toFixed(2)} 间隔${normalized.interval}s 限幅${normalized.range.toFixed(1)}% 进入区间${normalized.entryMin.toFixed(1)}~${normalized.entryMax.toFixed(1)}°C 稳定窗口${normalized.stableWindow}s 判稳波动${normalized.stableDelta.toFixed(1)}°C`
+      );
+      deviceStore.pushAlert({ tone: 'success', title: '微调参数已下发', message: `已更新${channelLabel}控制器微调工况参数。` });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '微调参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`微调参数下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchSmithParams(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const normalized = normalizeSmithPayload(configStore.smithDraft);
+    Object.assign(configStore.smithDraft, normalized);
+
+    try {
+      const cmd = `SMITH=${normalized.enabled ? 1 : 0},${normalized.gain.toFixed(2)},${normalized.tau.toFixed(1)},${normalized.delay.toFixed(1)},${normalized.blend.toFixed(3)},${normalized.maxLead.toFixed(2)}`;
+      await sendChannelCommand(cmd, 'ack', 'Smith 参数下发', targetChannel);
+
+      lastAppliedSmith.value = { ...normalized };
+      latestParamDispatch.value = {
+        channel: targetChannel,
+        timestamp: Date.now(),
+        kind: 'smith',
+        payload: { ...normalized }
+      };
+      await refreshSmithParams({ silent: true, channel: targetChannel });
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(
+        `Smith 参数已下发到${channelLabel}：${normalized.enabled ? '启用' : '关闭'} 增益${normalized.gain.toFixed(1)} 时间常数${normalized.tau.toFixed(0)}s 纯滞后${normalized.delay.toFixed(0)}s 混合${normalized.blend.toFixed(2)} 最大超前${normalized.maxLead.toFixed(1)}°C`
       );
       deviceStore.pushAlert({
         tone: 'success',
-        title: 'PID 参数更新成功',
-        message: `已更新${channelLabel}控制器 PID 参数。`
+        title: 'Smith 参数已下发',
+        message: `已更新${channelLabel}控制器 Smith 预估参数。`
       });
       return { applied: true, channel: targetChannel };
     } catch (error) {
-      deviceStore.pushAlert({ tone: 'danger', title: 'PID 参数下发失败', message: error.message || '未知错误' });
-      deviceStore.appendEvent(`PID 参数下发失败：${error.message}`);
+      deviceStore.pushAlert({ tone: 'danger', title: 'Smith 参数下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`Smith 参数下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchDeadband(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const value = Number(configStore.deadband);
+    if (!Number.isFinite(value)) {
+      deviceStore.pushAlert({ tone: 'warning', title: '死区未下发', message: '请输入有效的死区值。' });
+      return { applied: false };
+    }
+
+    try {
+      const cmd = `DEADBAND=${value.toFixed(2)}`;
+      await sendChannelCommand(cmd, 'ack', '死区下发', targetChannel);
+
+      lastAppliedDeadband.value = value;
+      latestParamDispatch.value = {
+        channel: targetChannel,
+        timestamp: Date.now(),
+        kind: 'deadband',
+        payload: { deadband: value }
+      };
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(`死区已下发到${channelLabel}：${value.toFixed(2)}°C`);
+      deviceStore.pushAlert({ tone: 'success', title: '死区已下发', message: `已更新${channelLabel}控制器死区为 ${value.toFixed(2)}°C。` });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '死区下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`死区下发失败：${error.message}`);
+      return { applied: false };
+    }
+  }
+
+  async function dispatchFineEnable(channel = null) {
+    const targetChannel = resolveChannel(channel);
+    const enabled = Boolean(configStore.fineEnabled);
+
+    try {
+      const cmd = `FINEEN=${enabled ? 1 : 0}`;
+      await sendChannelCommand(cmd, 'ack', '微调开关下发', targetChannel);
+
+      lastAppliedFineEnabled.value = enabled;
+      latestParamDispatch.value = {
+        channel: targetChannel,
+        timestamp: Date.now(),
+        kind: 'fineEnable',
+        payload: { enabled }
+      };
+      const channelLabel = targetChannel === 'ethernet' ? '网口' : '串口';
+      deviceStore.appendEvent(`微调开关已下发到${channelLabel}：${enabled ? '启用' : '禁用'}`);
+      deviceStore.pushAlert({
+        tone: 'success',
+        title: '微调开关已下发',
+        message: enabled
+          ? `已允许${channelLabel}控制器进入微调工况。`
+          : `已禁止${channelLabel}控制器进入微调工况，将保持变温工况。`
+      });
+      return { applied: true, channel: targetChannel };
+    } catch (error) {
+      deviceStore.pushAlert({ tone: 'danger', title: '微调开关下发失败', message: error.message || '未知错误' });
+      deviceStore.appendEvent(`微调开关下发失败：${error.message}`);
       return { applied: false };
     }
   }
@@ -1358,6 +1997,27 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   );
 
   watch(
+    () => JSON.stringify({
+      serialConnected: deviceStore.serialConnected,
+      ethernetConnected: deviceStore.ethernetConnected,
+      primaryChannel: deviceStore.primaryChannel,
+      controllerState,
+      tranDraft: configStore.tranDraft,
+      fineDraft: configStore.fineDraft,
+      smithDraft: configStore.smithDraft,
+      deadband: configStore.deadband,
+      fineEnabled: configStore.fineEnabled,
+      lastAppliedTran: lastAppliedTran.value,
+      lastAppliedFine: lastAppliedFine.value,
+      lastAppliedSmith: lastAppliedSmith.value,
+      lastAppliedDeadband: lastAppliedDeadband.value,
+      lastAppliedFineEnabled: lastAppliedFineEnabled.value,
+      currentSamples
+    }),
+    () => scheduleExternalSnapshotPublish()
+  );
+
+  watch(
     () => deviceStore.serialConnected,
     async (connected) => {
       if (connected) {
@@ -1374,6 +2034,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       controllerState.pwm = null;
       controllerState.goal = null;
       controllerState.feedback = null;
+      controllerState.predictedFeedback = null;
       controllerState.updatedAt = null;
 
       if (deviceStore.primaryChannel !== 'ethernet') {
@@ -1385,7 +2046,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
   watch(
     () => deviceStore.ethernetConnected,
-    (connected, wasConnected) => {
+    (connected) => {
       if (connected) {
         attachTcpProtocolListener();
         if (deviceStore.primaryChannel === 'ethernet') {
@@ -1436,7 +2097,11 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   );
 
   return {
-    pidDraft,
+    tranDraft,
+    fineDraft,
+    smithDraft,
+    deadband,
+    fineEnabled,
     plantDraft,
     curveHistory,
     curvePoints,
@@ -1451,9 +2116,13 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     furnaceState,
     currentMetrics,
     controllerState,
-    latestPidDispatch,
-    lastAppliedPid,
-    previousAppliedPid,
+    externalServiceStatus,
+    latestParamDispatch,
+    lastAppliedTran,
+    lastAppliedFine,
+    lastAppliedSmith,
+    lastAppliedDeadband,
+    lastAppliedFineEnabled,
     logDirectory,
     recordingState,
     recordingStatusText,
@@ -1472,18 +2141,28 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     resumeRecording,
     stopRecordingSession,
     applyProfile,
-    resetPidDraft,
+    resetTranDraft,
+    resetFineDraft,
+    resetSmithDraft,
     syncDraftToChannels,
     netDraft,
     serialProtocolState,
     tcpProtocolState,
     refreshControllerState,
-    refreshPidParameters,
+    refreshTranParams,
+    refreshFineParams,
+    refreshFineEnable,
+    refreshSmithParams,
+    refreshDeadband,
     refreshNetConfig,
     refreshControllerSnapshot,
     setControllerMode,
     applyManualPwm,
-    dispatchPidParameters,
+    dispatchTranParams,
+    dispatchFineParams,
+    dispatchSmithParams,
+    dispatchFineEnable,
+    dispatchDeadband,
     dispatchNetConfig,
     dispatchSaveConfig,
     dispatchResetConfig,

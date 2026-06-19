@@ -1,0 +1,295 @@
+{
+  "server": {
+    "name": "temperature-control",
+    "version": "1.0.0",
+    "endpoint": "http://[your-host-ip]:8056/mcp",
+    "transport": "json-rpc-over-http",
+    "protocolVersion": "2026-06-14"
+  },
+  "calling_guidance": {
+    "language": "zh-CN",
+    "summary": "Use these MCP tools to query and control the local temperature-control desktop application.",
+    "preflight": [
+      "Call temperature_get_status or temperature_refresh_snapshot before changing controller state.",
+      "Check snapshot.connection.primaryChannel and connection.*.connected before sending commands.",
+      "If channel is omitted, the system uses the current primary channel.",
+      "Use channel=serial for serial port control and channel=ethernet for ethernet control.",
+      "For manual PWM output, switch to MAN mode before setting PWM.",
+      "For target temperature control, switch to AUTO mode before setting temperature.",
+      "Use temperature_set_tran_pid for TRAN condition PID and temperature_set_fine_pid for FINE condition PID."
+    ],
+    "common_errors": [
+      "Device channel is not connected.",
+      "Renderer is not ready.",
+      "Device returned ACK=ERR.",
+      "Argument type or range is invalid."
+    ]
+  },
+  "tools": [
+    {
+      "name": "temperature_get_status",
+      "description": "Get the latest cached system snapshot, including connection, current mode, current condition, temperatures, PWM and PID configuration.",
+      "when_to_use": "Use this first when the user asks about current status, mode, condition, temperature or PID settings.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "example_call": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "temperature_get_status",
+          "arguments": {}
+        }
+      }
+    },
+    {
+      "name": "temperature_refresh_snapshot",
+      "description": "Query the controller through the selected channel and refresh mode, condition, TRAN PID, FINE PID, FINE enable flag and deadband.",
+      "when_to_use": "Use this when the user wants the newest device-side state instead of the cached snapshot.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_mode",
+      "description": "Switch controller mode. AUTO means automatic temperature control; MAN means manual PWM control.",
+      "when_to_use": "Use before setting target temperature or manual PWM if current mode is not suitable.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["mode"],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["AUTO", "MAN"]
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "mode": "AUTO",
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_manual_pwm",
+      "description": "Set manual PWM output percentage. The controller should be in MAN mode before using this tool.",
+      "when_to_use": "Use when the user explicitly asks for manual heating/fan PWM output.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["pwm"],
+        "properties": {
+          "pwm": {
+            "type": "number",
+            "minimum": -100,
+            "maximum": 100,
+            "description": "Manual PWM percentage. Positive values heat, negative values fan/cool if supported by firmware."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "pwm": 35,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_target_temperature",
+      "description": "Set target temperature for AUTO mode.",
+      "when_to_use": "Use when the user asks to set or change the desired temperature.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["temperature"],
+        "properties": {
+          "temperature": {
+            "type": "number",
+            "description": "Target temperature in degrees Celsius."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "temperature": 58,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_tran_pid",
+      "description": "Set TRAN condition PID parameters. TRAN is the variable-temperature / coarse control condition.",
+      "when_to_use": "Use when the user wants to tune the main variable-temperature PID parameters.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["kp", "ki", "kd"],
+        "properties": {
+          "kp": {
+            "type": "number",
+            "description": "Proportional gain."
+          },
+          "ki": {
+            "type": "number",
+            "description": "Integral gain."
+          },
+          "kd": {
+            "type": "number",
+            "description": "Derivative gain."
+          },
+          "interval": {
+            "type": "number",
+            "description": "Adjustment interval in seconds."
+          },
+          "sepThreshold": {
+            "type": "number",
+            "description": "Integral separation threshold in degrees Celsius."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "kp": 3,
+        "ki": 0.3,
+        "kd": 1,
+        "interval": 3,
+        "sepThreshold": 10,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_fine_pid",
+      "description": "Set FINE condition PID parameters. FINE is the near-target fine-tuning condition.",
+      "when_to_use": "Use when the user wants to tune near-target stability, small oscillation or fine adjustment behavior.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["kp", "ki", "kd"],
+        "properties": {
+          "kp": {
+            "type": "number",
+            "description": "Proportional gain."
+          },
+          "ki": {
+            "type": "number",
+            "description": "Integral gain."
+          },
+          "kd": {
+            "type": "number",
+            "description": "Derivative gain."
+          },
+          "interval": {
+            "type": "number",
+            "description": "Adjustment interval in seconds."
+          },
+          "range": {
+            "type": "number",
+            "description": "Maximum output change per step."
+          },
+          "entryMin": {
+            "type": "number",
+            "description": "Minimum absolute error to enter FINE condition."
+          },
+          "entryMax": {
+            "type": "number",
+            "description": "Maximum absolute error to enter FINE condition."
+          },
+          "stableWindow": {
+            "type": "number",
+            "description": "Stability window in seconds."
+          },
+          "stableDelta": {
+            "type": "number",
+            "description": "Allowed fluctuation in degrees Celsius during the stability window."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "kp": 1.5,
+        "ki": 0.1,
+        "kd": 2,
+        "interval": 8,
+        "range": 5,
+        "entryMin": 1,
+        "entryMax": 3,
+        "stableWindow": 10,
+        "stableDelta": 0.3,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_deadband",
+      "description": "Set shared PID deadband in degrees Celsius.",
+      "when_to_use": "Use when the user wants to reduce near-target oscillation or adjust acceptable temperature error.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["deadband"],
+        "properties": {
+          "deadband": {
+            "type": "number",
+            "description": "Shared deadband in degrees Celsius."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "deadband": 0.3,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_fine_enable",
+      "description": "Enable or disable entry into FINE condition.",
+      "when_to_use": "Use when the user wants to allow or forbid automatic transition into FINE condition.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "enabled": true,
+        "channel": "serial"
+      }
+    }
+  ],
+  "$defs": {
+    "channel": {
+      "type": "string",
+      "enum": ["serial", "ethernet"],
+      "description": "Target channel. Omit this field to use the current primary channel."
+    }
+  }
+}

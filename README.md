@@ -29,6 +29,22 @@
 - serialport
 - electron-builder
 
+## 外部集成接口
+
+系统启动后会在本机开放：
+
+- HTTP + MCP: `http://127.0.0.1:8056`
+- WebSocket: `ws://127.0.0.1:8057`
+
+外部软件可以查询当前手/自动模式、当前工况、实时采样、TRAN/FINE PID 参数、死区和微调开关，也可以下发模式、PWM、目标温度和 PID 配置。
+
+外部接口文档：
+
+- 总览与调用说明：[docs/external-api.md](docs/external-api.md)
+- 快速接入示例：[docs/integration-quickstart.md](docs/integration-quickstart.md)
+- HTTP/OpenAPI 规范：[docs/openapi.yaml](docs/openapi.yaml)
+- MCP 工具清单：[docs/mcp-tools.json](docs/mcp-tools.json)
+
 ## 运行环境
 
 建议环境如下：
@@ -77,6 +93,406 @@ npm run build:linux
 
 Windows 打包结果会带管理员权限清单，安装后的程序启动时会自动请求管理员权限。
 
+---
+
+# Temperature Control System (STM32F407 + LAN8720A)
+
+## 1. Hardware Connections
+
+| Function | Pin | Description |
+|---|---|---|
+| DS18B20 | PB5 | Board temperature sensor |
+| NTC Thermistor | PA0 (ADC1) | Heater temperature feedback |
+| Heater Control | PE5 | Heater MOSFET |
+| TIM9 CH2 | -- | PWM control (heater/fan) |
+| Fan Control | PE4 | Circulation fan enable |
+| Buzzer | PB6 | Alert sound |
+| Key UP | PD1 | Increase |
+| Key DOWN | PD2 | Decrease |
+| Key STEP | PD3 | Step toggle (1/5/10) |
+| Key AUTO | PD4 | Auto/Manual toggle |
+| LED1 | PB3 | Status indicator |
+| LED2 | PB4 | Status indicator |
+| HMI Display | PD8/PD9 (USART3) | Touch screen |
+| Debug UART | PA9/PA10 (USART1) | PC communication |
+| Ethernet (RMII) | PA1,PA2,PA7,PC1,PC4,PC5,PB11,PB12,PB13 | LAN8720A |
+| ETH_RESET | PB0 | LAN8720A reset |
+
+### Network Setup (Direct PC Connection)
+
+Default: **Static IP** (no DHCP).
+
+**Step 1: Physical Connection**
+- Connect STM32 RJ45 to PC Ethernet port with a cable.
+- Check that the Link LED (green) near the LAN8720A is **solid ON**.
+
+**Step 2: Configure PC Static IP**
+1. Control Panel -> Network and Sharing Center -> Change Adapter Settings
+2. Right-click Ethernet -> Properties -> Internet Protocol Version 4 (TCP/IPv4)
+3. Select "Use the following IP address":
+   - IP address: `192.168.1.10`
+   - Subnet mask: `255.255.255.0`
+   - Default gateway: leave blank
+4. Click OK
+
+**Step 3: Verify**
+```bash
+ping 192.168.1.100
+```
+Expected: `Reply from 192.168.1.100: bytes=32 time<1ms TTL=64`
+
+**Step 4: TCP Connection**
+```bash
+nc 192.168.1.100 8000
+# Or PuTTY: Connection type=Raw, Host=192.168.1.100, Port=8000
+```
+
+### Router Connection
+
+- Router LAN must be `192.168.1.x` subnet
+- `192.168.1.100` must not be occupied by another device
+- Use `!NET=...` via UART to change IP, then `!SAVE`
+
+---
+
+## 2. Control Architecture
+
+```
+                    +-------------------+
+Target Temp ------->|                   |------> PWM Output (0~100%)
+                    |  Incremental PID  |          |
+Feedback Temp ----->|  + Dead-time      |     +----+----+
+                    |  Compensation     |     |         |
+                    +-------------------+   Heater     Fan
+                                             (>0)      (<0)
+```
+
+### How It Works
+
+The thermal system has a large **pure time delay** (e.g., heat takes seconds to propagate from the heater to the NTC sensor). A traditional PID that adjusts every second will over-correct because the effect of the previous adjustment hasn't reached the sensor yet.
+
+**Solution: Dead-time aware incremental PID**
+
+1. **Error history** is updated every second (for accurate derivative calculation)
+2. **PID output** is only updated every `pid_interval` seconds (default: 5s, >= system dead time)
+3. Between adjustments, PWM is held constant, allowing the thermal system to respond
+4. A **deadband** (default: +/-0.3°C) freezes output when the temperature is close enough
+5. **Output rate limiting** (default: +/-8% per step) prevents aggressive PWM swings
+
+### PID Formula
+
+```
+delta_u = Kp * [e(k) - e(k-1)]
+        + Ki * e(k) * Ts
+        + Kd * [e(k) - 2*e(k-1) + e(k-2)] / Ts
+
+output = clamp(output_prev + delta_u, 0, 100)
+```
+
+Where:
+- `e(k)` = target temperature - current temperature
+- `Ts` = `pid_interval` (sampling period in seconds)
+- `delta_u` is clamped to `+/- pid_max_delta`
+
+---
+
+## 3. Parameters
+
+### A. System Control
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `manual_flag` | 1 (Manual) | 0/1 | 0=Auto, 1=Manual PWM |
+| `target_temp` | 30.0 | -10~100 °C | Target temperature (auto mode) |
+| `manual_pwm` | 0 | -100~100 | Manual PWM value |
+| `step_value` | 1 | 1/5/10 | Key step amount |
+
+### B. 变温工况 — 位置式 PID（主力）
+
+位置式 PID 直接输出，靠积分分离防饱和。
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `tran_kp` | 3.0 | 0.1~50 | Proportional gain |
+| `tran_ki` | 0.3 | 0~5 | Integral gain (eliminates steady-state error) |
+| `tran_kd` | 1.0 | 0~10 | Derivative gain (damping, anti-overshoot) |
+| `tran_interval` | 3 | 1~60 sec | Adjust interval |
+| `tran_sep_threshold` | 10.0 | 1~50 °C | Integral separation threshold (|error|>threshold → Ki off) |
+
+### C. 微调工况 — 增量式 PID
+
+进入条件：系统稳定 + `fine_entry_min ≤ |error| ≤ fine_entry_max`
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `fine_kp` | 1.5 | 0.1~20 | Proportional gain (more conservative) |
+| `fine_ki` | 0.1 | 0~3 | Integral gain |
+| `fine_kd` | 2.0 | 0~10 | Derivative gain (stronger damping) |
+| `fine_interval` | 8 | 1~60 sec | Adjust interval (slower, wait for system response) |
+| `fine_range` | 5.0 | 1~20 % | Max output change per step (tighter) |
+| `fine_entry_min` | 1.0 | 0.1~10 °C | Min \|error\| to enter fine mode |
+| `fine_entry_max` | 3.0 | 0.5~20 °C | Max \|error\| to enter fine mode |
+
+### D. 共享
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `pid_deadband` | 0.3 | 0.1~2.0 °C | Deadband width (shared by TRAN and FINE) |
+
+### E. Network
+
+| Parameter | Default | Description |
+|---|---|---|
+| `eth_ip` | 192.168.1.100 | Static IP (reboot required) |
+| `eth_gateway` | 192.168.1.1 | Gateway (reboot required) |
+| `eth_netmask` | 255.255.255.0 | Netmask (reboot required) |
+| `tcp_port` | 8000 | TCP listen port (reboot required) |
+| `eth_mac` | 02:00:00:00:00:01 | MAC address (reboot required) |
+
+---
+
+## 4. Command Protocol
+
+### Frame Format
+
+```
+Request: !BODY\r\n              (without checksum)
+         !BODY*XX\r\n           (with XOR checksum)
+
+Reply:   !ACK=OK\r\n            (success)
+         !ACK=OK*XX\r\n
+         !ACK=ERR\r\n           (failure)
+         !ACK=ERR*XX\r\n
+         !response\r\n          (query result)
+         !response*XX\r\n
+```
+
+- `!` frame header, `*XX` optional XOR checksum, `\r\n` frame tail
+- Checksum: XOR of all bytes from `!` through last body character, formatted as 2-char uppercase hex
+- Device accepts both formats (with and without checksum)
+- **UART (USART1) and TCP (port 8000) use the same protocol**
+
+### Commands
+
+#### System Control
+
+| Command | Example | Description |
+|---|---|---|
+| `MODE=AUTO` | `!MODE=AUTO\r\n` | Switch to auto mode |
+| `MODE=MAN` | `!MODE=MAN\r\n` | Switch to manual mode |
+| `TEMP=58.0` | `!TEMP=58.0\r\n` | Set target temperature (°C) |
+| `PWM=50` | `!PWM=50\r\n` | Set manual PWM (-100~100, manual only) |
+| `STEP=5` | `!STEP=5\r\n` | Set key step (1/5/10) |
+
+#### PID Tuning
+
+| Command | Example | Description |
+|---|---|---|
+| `TRAN=3.0,0.3,1.0` | `!TRAN=3.0,0.3,1.0\r\n` | Set Kp, Ki, Kd |
+| `TRAN=3.0,0.3,1.0,3` | +interval | Also set interval |
+| `TRAN=3.0,0.3,1.0,3,10` | +sep_threshold | Set all 5 params |
+| `FINE=1.5,0.1,2.0` | `!FINE=1.5,0.1,2.0\r\n` | Set Kp, Ki, Kd |
+| `FINE=1.5,0.1,2.0,8` | +interval | Also set interval |
+| `FINE=1.5,0.1,2.0,8,5` | +range | Also set range |
+| `FINE=1.5,0.1,2.0,8,5,1.0,3.0` | All 7 params | Set all (last 2 = entry_min, entry_max) |
+| `FINEEN=1` | `!FINEEN=1\r\n` | Enable fine tuning condition; `0` keeps auto control in TRAN |
+| `DEADBAND=0.3` | `!DEADBAND=0.3\r\n` | Set deadband width (°C) |
+
+#### Network (reboot required after change)
+
+| Command | Example |
+|---|---|
+| `NET=192.168.1.100,192.168.1.1,255.255.255.0,8000` | Set IP, GW, Netmask, Port |
+| `MAC=02:00:00:00:00:01` | Set MAC address |
+
+#### Query
+
+| Command | Reply Example |
+|---|---|
+| `GET=STATE` | `STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575` |
+| `GET=TRAN` | `TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3,ST:10.0` |
+| `GET=FINE` | `FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0,EMN:1.0,EMX:3.0` |
+| `GET=FINEEN` | `FINEEN=1` |
+| `GET=DEADBAND` | `DEADBAND=0.30` |
+| `GET=NET` | `NET=IP:192.168.1.100,GW:192.168.1.1,NM:255.255.255.0,PORT:8000` |
+| `GET=ETH` | `ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0` |
+| `GET=CONFIG` | All config parameters (multi-line) |
+
+#### Persistence
+
+| Command | Description |
+|---|---|
+| `SAVE` | Save current config to Flash immediately |
+| `RESET` | Restore factory defaults (preserves MAC) |
+
+> Parameters auto-save to Flash after 500ms delay on change. `!SAVE` forces immediate save.
+
+---
+
+## 5. Response Fields
+
+### STATE (`GET=STATE`)
+
+```
+STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| MODE | Mode | AUTO=自动, MAN=手动 |
+| PWM | Current PWM | -100~100, positive=heat, negative=fan |
+| GOAL | Target ×10 | e.g. 580 = 58.0°C |
+| FB | Feedback ×10 | e.g. 575 = 57.5°C |
+
+### TRAN (`GET=TRAN`) — 变温工况
+
+```
+TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| KP | tran_kp | Proportional gain |
+| KI | tran_ki | Integral gain |
+| KD | tran_kd | Derivative gain |
+| INT | tran_interval | Adjust interval (seconds) |
+
+### FINE (`GET=FINE`) — 微调工况
+
+```
+FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0
+```
+
+| Field | Meaning | Description |
+|---|---|---|
+| KP | fine_kp | Proportional gain (conservative) |
+| KI | fine_ki | Integral gain |
+| KD | fine_kd | Derivative gain (strong damping) |
+| INT | fine_interval | Adjust interval (seconds, slower) |
+| RNG | fine_range | Max output change per step (%, tighter) |
+
+### ETH Diagnostics (`GET=ETH`)
+
+```
+ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0
+```
+
+| Field | Meaning |
+|---|---|
+| LINK | 1=cable connected, 0=disconnected |
+| PHY | PHY chip address (0 or 1, 255=not found) |
+| ERR | Error code (0=OK) |
+| PHYID | Chip ID (0007C0F1=LAN8720A, 00000000=not detected) |
+| RX | Received packets |
+| TX | Transmitted packets |
+| ARP | ARP replies |
+| ICMP | Ping replies |
+| ANEG | 1=auto-negotiation complete, 0=not complete |
+| TCP | 1=client connected, 0=no client |
+
+### Ethernet Error Codes
+
+| Code | Name | Meaning | Fix |
+|---|---|---|---|
+| 0 | `ETH_ERR_OK` | Link OK | -- |
+| 1 | `ETH_ERR_NO_PHY` | PHY chip not found | Check PHY soldering/power/crystal |
+| 2 | `ETH_ERR_NO_LINK` | No cable link | Check cable, peer power |
+| 3 | `ETH_ERR_ANEG_TIMEOUT` | Auto-negotiation timeout | Check 50MHz RMII clock |
+| 4 | `ETH_ERR_NOT_INITED` | ETH not initialized | Check eth.c included in build |
+
+---
+
+## 6. Quick Start
+
+### First Power-On
+
+```
+1. Default: manual mode, target 30°C
+2. Connect UART (115200 8N1) or TCP (nc 192.168.1.100 8000)
+3. Send: MODE=AUTO
+4. Send: TEMP=58.0
+5. Observe: PID adjusts every pid_interval seconds (default 5s)
+```
+
+### Tuning Guide
+
+```
+1. TRAN (变温工况 — 位置式 PID):
+   Temperature rises too slowly -> Increase tran_kp (3→5)
+   Temperature overshoots       -> Increase tran_kd (1→3)
+   Steady-state error persists  -> Increase tran_ki (0.3→0.6)
+   Integral windup / PWM saturates -> Increase tran_interval (3→8) or decrease tran_ki
+
+2. FINE (微调工况 — 增量式 PID):
+   Small oscillations near target -> Decrease fine_kp (1.5→0.8), increase fine_kd (2→4)
+   Convergence too slow           -> Increase fine_ki (0.1→0.3)
+   PWM jumps too often            -> Increase fine_interval (8→15) or decrease fine_range (5→3)
+
+3. DEADBAND (共享死区):
+   Small oscillations near target -> Increase (0.3→0.5)
+   Temperature stays off by ~0.5°C -> Decrease (0.3→0.1)
+
+4. Save:
+   SAVE
+```
+
+---
+
+## 7. Build (STM32)
+
+### Keil MDK
+
+- Project: `USER/DS18B20.uvprojx`
+- MCU: STM32F407VETx
+- StdPeriph Library: V1.4.0
+- Compiler: ARMCC V5.06
+
+### File Structure
+
+```
+USER/
+  main.c              Main program
+  app_config.h/.c     Unified config system
+  flash_params.h/.c   Flash persistence
+  pid_control.h/.c    PID controller
+
+HARDWARE/
+  ETH/eth.h/.c        Ethernet driver
+  LED/                LED driver
+  DS18B20/            Temperature sensor
+  KEY/                Keys
+  BEEP/               Buzzer
+  TIMER/              Timer
+  ADC/                ADC
+  HMI/                HMI display
+  PWM/                PWM output
+  DataScope_DP/       Data oscilloscope
+
+SYSTEM/
+  delay/              Delay
+  sys/                System
+  usart/              UART
+
+FWLIB/                STM32F4 StdPeriph Library
+```
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Temp stuck below target | TRAN Ki too weak | Increase tran_ki (0.3→0.6) |
+| Large overshoot on heat-up | TRAN Kp too high / Kd too low | Decrease tran_kp (5→3), increase tran_kd (1→3) |
+| PWM oscillates or saturates | TRAN Ki windup / interval too short | Increase tran_interval (3→8), decrease tran_ki |
+| Oscillation near target | FINE Kp too high / Kd too low | Decrease fine_kp (1.5→0.8), increase fine_kd (2→4) |
+| Slow convergence near target | FINE Ki too weak / interval too long | Increase fine_ki (0.1→0.3), decrease fine_interval (15→8) |
+| Steady oscillation ±0.3°C | Deadband too small | Increase pid_deadband (0.3→0.5) |
+| Network not connecting | IP mismatch / hardware | Use UART `GET=ETH` for diagnostics |
+| Flash save fails | Sector erase error | Check FLASH_Sector_7 not occupied |
+
+---
+
 ## 主要页面说明
 
 ### 1. 首页
@@ -97,7 +513,7 @@ Windows 打包结果会带管理员权限清单，安装后的程序启动时会
 
 - 曲线横轴会随着采样推进持续更新
 - 曲线支持拖动回看历史数据
-- 可通过“回到最新”按钮恢复实时视图
+- 可通过"回到最新"按钮恢复实时视图
 
 ### 2. PID 整定页
 

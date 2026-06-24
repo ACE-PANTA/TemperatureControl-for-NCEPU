@@ -1,53 +1,36 @@
-# 温控系统上位机
+﻿# 温控系统上位机
 
-这是一个用于华北电力大学自动化系嵌入式综合实验的温控对象上位机程序，面向实验过程中的串口通信、温度曲线观察、PID 参数整定、仿真数据记录与 CSV 导出等场景，并预留网口通信扩展能力。
+本项目是一个用于温度控制实验的桌面上位机程序，面向串口/网口设备连接、实时温度监控、PID 参数整定、CSV 数据记录以及外部系统集成等场景。
 
-项目基于 Vue 3 + Electron 构建：
+项目基于 Vue 3 与 Electron 构建：
 
-- Vue 负责界面渲染、页面交互与状态管理
-- Electron 负责桌面应用封装，以及串口、文件读写等系统能力接入，并为后续网口能力预留系统接口
+- Vue 负责界面渲染、页面交互和状态管理。
+- Electron 负责桌面应用封装、串口通信、文件读写、CSV 落盘和本机外部接口服务。
 
-## 项目用途
+## 功能概览
 
-本程序主要用于以下实验环节：
-
-- 温控过程实时监测与曲线展示
-- 串口链路下的设备连接测试
-- 网口通信界面预留与后续协议扩展准备
-- PID 参数调节、下发与效果观察
-- 二阶振荡对象仿真与目标温度跟踪
-- 温度采样数据按 CSV 文件记录，便于实验后分析
-
-当前版本已经可以基本跑通真实串口通信、模拟输入与温控对象仿真流程，可用于实验联调、界面演示和上位机功能验证；网口功能目前仍处于待实现状态。
+- 实时显示温度曲线、目标温度、控制输出和运行状态。
+- 支持串口设备扫描、连接、断开和命令下发。
+- 支持网口设备连接入口，并可作为主通道参与控制与采样。
+- 支持自动/手动控制模式切换、目标温度设置和手动 PWM 下发。
+- 支持变温工况 PID、微调工况 PID、Smith 预估控制和共享死区参数整定。
+- 支持实验数据按 CSV 文件记录，可配置保存目录和记录策略。
+- 提供 HTTP、WebSocket 和 MCP 本机接口，便于脚本、第三方系统或大模型客户端接入。
 
 ## 技术栈
 
 - Vue 3
-- Electron
-- Pinia
 - Vue Router
+- Pinia
+- Electron
+- electron-vite
 - serialport
+- ws
 - electron-builder
-
-## 外部集成接口
-
-系统启动后会在本机开放：
-
-- HTTP + MCP: `http://127.0.0.1:8056`
-- WebSocket: `ws://127.0.0.1:8057`
-
-外部软件可以查询当前手/自动模式、当前工况、实时采样、TRAN/FINE PID 参数、死区和微调开关，也可以下发模式、PWM、目标温度和 PID 配置。
-
-外部接口文档：
-
-- 总览与调用说明：[docs/external-api.md](docs/external-api.md)
-- 快速接入示例：[docs/integration-quickstart.md](docs/integration-quickstart.md)
-- HTTP/OpenAPI 规范：[docs/openapi.yaml](docs/openapi.yaml)
-- MCP 工具清单：[docs/mcp-tools.json](docs/mcp-tools.json)
 
 ## 运行环境
 
-建议环境如下：
+建议使用以下环境：
 
 - Windows 10 或 Windows 11
 - Node.js 18 及以上
@@ -55,30 +38,34 @@
 
 说明：
 
-- 应用在 Windows 下启动时会检查管理员权限
-- 若当前未以管理员身份运行，程序会自动申请管理员权限
-- 串口访问以及部分文件读写操作依赖管理员权限
+- Windows 下访问串口和部分文件能力可能需要管理员权限。
+- 如果应用启动时申请管理员权限，请按实验环境需要允许。
+- 打包后的 Windows 程序会携带管理员权限清单。
 
-## 安装依赖
+## 安装与启动
+
+安装依赖：
 
 ```bash
 npm install
 ```
 
-## 开发启动
+开发启动：
 
 ```bash
 npm run dev
 ```
 
-开发模式下会启动 Electron + Vue 联合调试环境。
+预览已构建产物：
 
-如果系统弹出管理员权限申请，请允许，否则串口和部分日志功能可能无法正常使用。
+```bash
+npm run start
+```
 
 ## 构建打包
 
 ```bash
-# 仅构建前后端产物
+# 构建 Electron 与前端产物
 npm run build
 
 # 构建 Windows 安装包
@@ -91,525 +78,155 @@ npm run build:mac
 npm run build:linux
 ```
 
-Windows 打包结果会带管理员权限清单，安装后的程序启动时会自动请求管理员权限。
+## 页面说明
 
----
+### 监控主页
 
-# Temperature Control System (STM32F407 + LAN8720A)
+监控主页用于实验过程观察和连接控制，主要包含：
 
-## 1. Hardware Connections
+- 实时温度曲线。
+- 目标温度设置。
+- 串口和网口连接状态。
+- 主通道选择。
+- 录制开始、暂停、恢复和结束。
+- CSV 会话状态。
+- 系统事件和操作日志。
 
-| Function | Pin | Description |
-|---|---|---|
-| DS18B20 | PB5 | Board temperature sensor |
-| NTC Thermistor | PA0 (ADC1) | Heater temperature feedback |
-| Heater Control | PE5 | Heater MOSFET |
-| TIM9 CH2 | -- | PWM control (heater/fan) |
-| Fan Control | PE4 | Circulation fan enable |
-| Buzzer | PB6 | Alert sound |
-| Key UP | PD1 | Increase |
-| Key DOWN | PD2 | Decrease |
-| Key STEP | PD3 | Step toggle (1/5/10) |
-| Key AUTO | PD4 | Auto/Manual toggle |
-| LED1 | PB3 | Status indicator |
-| LED2 | PB4 | Status indicator |
-| HMI Display | PD8/PD9 (USART3) | Touch screen |
-| Debug UART | PA9/PA10 (USART1) | PC communication |
-| Ethernet (RMII) | PA1,PA2,PA7,PC1,PC4,PC5,PB11,PB12,PB13 | LAN8720A |
-| ETH_RESET | PB0 | LAN8720A reset |
+曲线支持历史数据查看，并可回到最新采样视图。
 
-### Network Setup (Direct PC Connection)
+### 参数整定
 
-Default: **Static IP** (no DHCP).
+参数整定页用于控制参数配置和下发，主要包含：
 
-**Step 1: Physical Connection**
-- Connect STM32 RJ45 to PC Ethernet port with a cable.
-- Check that the Link LED (green) near the LAN8720A is **solid ON**.
+- 变温工况 PID 参数。
+- 微调工况 PID 参数。
+- Smith 预估控制参数。
+- 共享死区和微调开关。
+- 当前参数、已生效参数和历史参数对照。
+- 超调、稳定时间、控制输出、扰动量等运行指标。
 
-**Step 2: Configure PC Static IP**
-1. Control Panel -> Network and Sharing Center -> Change Adapter Settings
-2. Right-click Ethernet -> Properties -> Internet Protocol Version 4 (TCP/IPv4)
-3. Select "Use the following IP address":
-   - IP address: `192.168.1.10`
-   - Subnet mask: `255.255.255.0`
-   - Default gateway: leave blank
-4. Click OK
+### 系统配置
 
-**Step 3: Verify**
-```bash
-ping 192.168.1.100
-```
-Expected: `Reply from 192.168.1.100: bytes=32 time<1ms TTL=64`
+系统配置页用于记录策略和显示策略配置，主要包含：
 
-**Step 4: TCP Connection**
-```bash
-nc 192.168.1.100 8000
-# Or PuTTY: Connection type=Raw, Host=192.168.1.100, Port=8000
-```
+- 启用或关闭 CSV 记录。
+- 设置是否自动开始记录。
+- 设置全部断连时是否自动暂停。
+- 配置 CSV 保存目录。
+- 配置曲线横轴时间间隔和显示格数。
 
-### Router Connection
+## 基本使用流程
 
-- Router LAN must be `192.168.1.x` subnet
-- `192.168.1.100` must not be occupied by another device
-- Use `!NET=...` via UART to change IP, then `!SAVE`
+1. 启动程序，并确认运行权限满足当前实验要求。
+2. 在监控主页检查连接状态、主通道和记录策略。
+3. 扫描并连接串口设备，或按实验需要连接网口设备。
+4. 设置主通道，确认设备状态可以正常刷新。
+5. 在监控主页设置目标温度或切换手动 PWM。
+6. 如需记录实验数据，启用 CSV 后开始录制。
+7. 如需整定控制效果，进入参数整定页修改 PID 或 Smith 参数并下发。
+8. 实验结束后停止录制，使用生成的 CSV 文件进行分析。
 
----
+## CSV 记录
 
-## 2. Control Architecture
+CSV 记录以当前采样数据为基础，串口和网口通道分别维护记录状态。典型字段包括：
 
-```
-                    +-------------------+
-Target Temp ------->|                   |------> PWM Output (0~100%)
-                    |  Incremental PID  |          |
-Feedback Temp ----->|  + Dead-time      |     +----+----+
-                    |  Compensation     |     |         |
-                    +-------------------+   Heater     Fan
-                                             (>0)      (<0)
-```
+- `sampleIndex`：采样序号。
+- `elapsedSeconds`：本次记录开始后的经过秒数。
+- `channel`：数据通道，通常为 `serial` 或 `ethernet`。
+- `temperature`：反馈温度。
+- `setpoint`：当前设定值。
+- `requestedSetpoint`：请求目标温度。
+- `controlOutput`：控制输出。
+- `disturbance`：扰动量。
+- `overshootPercent`：超调百分比。
+- `kp` / `ki` / `kd`：控制参数。
 
-### How It Works
+如果未配置有效保存目录，系统会保留内存中的采样数据，但不会落盘写入 CSV。
 
-The thermal system has a large **pure time delay** (e.g., heat takes seconds to propagate from the heater to the NTC sensor). A traditional PID that adjusts every second will over-correct because the effect of the previous adjustment hasn't reached the sensor yet.
+## 外部集成接口
 
-**Solution: Dead-time aware incremental PID**
+应用启动后会在本机开放以下接口：
 
-1. **Error history** is updated every second (for accurate derivative calculation)
-2. **PID output** is only updated every `pid_interval` seconds (default: 5s, >= system dead time)
-3. Between adjustments, PWM is held constant, allowing the thermal system to respond
-4. A **deadband** (default: +/-0.3°C) freezes output when the temperature is close enough
-5. **Output rate limiting** (default: +/-8% per step) prevents aggressive PWM swings
+- HTTP API：`http://127.0.0.1:8056`
+- MCP Endpoint：`http://127.0.0.1:8056/mcp`
+- WebSocket：`ws://127.0.0.1:8057`
 
-### PID Formula
+常用入口：
 
-```
-delta_u = Kp * [e(k) - e(k-1)]
-        + Ki * e(k) * Ts
-        + Kd * [e(k) - 2*e(k-1) + e(k-2)] / Ts
+- 健康检查：`GET http://127.0.0.1:8056/health`
+- 状态快照：`GET http://127.0.0.1:8056/api/snapshot`
+- 主动刷新设备状态：`POST http://127.0.0.1:8056/api/refresh`
+- 设置模式：`POST http://127.0.0.1:8056/api/mode`
+- 设置目标温度：`POST http://127.0.0.1:8056/api/target-temperature`
+- 设置手动 PWM：`POST http://127.0.0.1:8056/api/manual-pwm`
+- 下发变温 PID：`POST http://127.0.0.1:8056/api/pid/tran`
+- 下发微调 PID：`POST http://127.0.0.1:8056/api/pid/fine`
+- 保存设备配置：`POST http://127.0.0.1:8056/api/save`
 
-output = clamp(output_prev + delta_u, 0, 100)
-```
+详细接口文档：
 
-Where:
-- `e(k)` = target temperature - current temperature
-- `Ts` = `pid_interval` (sampling period in seconds)
-- `delta_u` is clamped to `+/- pid_max_delta`
+- [外部接口总览](docs/external-api.md)
+- [快速接入指南](docs/integration-quickstart.md)
+- [OpenAPI 规范](docs/openapi.yaml)
+- [MCP 工具清单](docs/mcp-tools.json)
 
----
+## 设备通信协议摘要
 
-## 3. Parameters
+串口和 TCP 通道使用同一类文本命令协议，命令以 `!` 开头，以回车换行结束。
 
-### A. System Control
+示例：
 
-| Parameter | Default | Range | Description |
-|---|---|---|---|
-| `manual_flag` | 1 (Manual) | 0/1 | 0=Auto, 1=Manual PWM |
-| `target_temp` | 30.0 | -10~100 °C | Target temperature (auto mode) |
-| `manual_pwm` | 0 | -100~100 | Manual PWM value |
-| `step_value` | 1 | 1/5/10 | Key step amount |
-
-### B. 变温工况 — 位置式 PID（主力）
-
-位置式 PID 直接输出，靠积分分离防饱和。
-
-| Parameter | Default | Range | Description |
-|---|---|---|---|
-| `tran_kp` | 3.0 | 0.1~50 | Proportional gain |
-| `tran_ki` | 0.3 | 0~5 | Integral gain (eliminates steady-state error) |
-| `tran_kd` | 1.0 | 0~10 | Derivative gain (damping, anti-overshoot) |
-| `tran_interval` | 3 | 1~60 sec | Adjust interval |
-| `tran_sep_threshold` | 10.0 | 1~50 °C | Integral separation threshold (|error|>threshold → Ki off) |
-
-### C. 微调工况 — 增量式 PID
-
-进入条件：系统稳定 + `fine_entry_min ≤ |error| ≤ fine_entry_max`
-
-| Parameter | Default | Range | Description |
-|---|---|---|---|
-| `fine_kp` | 1.5 | 0.1~20 | Proportional gain (more conservative) |
-| `fine_ki` | 0.1 | 0~3 | Integral gain |
-| `fine_kd` | 2.0 | 0~10 | Derivative gain (stronger damping) |
-| `fine_interval` | 8 | 1~60 sec | Adjust interval (slower, wait for system response) |
-| `fine_range` | 5.0 | 1~20 % | Max output change per step (tighter) |
-| `fine_entry_min` | 1.0 | 0.1~10 °C | Min \|error\| to enter fine mode |
-| `fine_entry_max` | 3.0 | 0.5~20 °C | Max \|error\| to enter fine mode |
-
-### D. 共享
-
-| Parameter | Default | Range | Description |
-|---|---|---|---|
-| `pid_deadband` | 0.3 | 0.1~2.0 °C | Deadband width (shared by TRAN and FINE) |
-
-### E. Network
-
-| Parameter | Default | Description |
-|---|---|---|
-| `eth_ip` | 192.168.1.100 | Static IP (reboot required) |
-| `eth_gateway` | 192.168.1.1 | Gateway (reboot required) |
-| `eth_netmask` | 255.255.255.0 | Netmask (reboot required) |
-| `tcp_port` | 8000 | TCP listen port (reboot required) |
-| `eth_mac` | 02:00:00:00:00:01 | MAC address (reboot required) |
-
----
-
-## 4. Command Protocol
-
-### Frame Format
-
-```
-Request: !BODY\r\n              (without checksum)
-         !BODY*XX\r\n           (with XOR checksum)
-
-Reply:   !ACK=OK\r\n            (success)
-         !ACK=OK*XX\r\n
-         !ACK=ERR\r\n           (failure)
-         !ACK=ERR*XX\r\n
-         !response\r\n          (query result)
-         !response*XX\r\n
+```text
+!MODE=AUTO
+!TEMP=58.0
+!PWM=35
+!GET=STATE
+!GET=TRAN
+!GET=FINE
+!SAVE
 ```
 
-- `!` frame header, `*XX` optional XOR checksum, `\r\n` frame tail
-- Checksum: XOR of all bytes from `!` through last body character, formatted as 2-char uppercase hex
-- Device accepts both formats (with and without checksum)
-- **UART (USART1) and TCP (port 8000) use the same protocol**
+典型响应：
 
-### Commands
-
-#### System Control
-
-| Command | Example | Description |
-|---|---|---|
-| `MODE=AUTO` | `!MODE=AUTO\r\n` | Switch to auto mode |
-| `MODE=MAN` | `!MODE=MAN\r\n` | Switch to manual mode |
-| `TEMP=58.0` | `!TEMP=58.0\r\n` | Set target temperature (°C) |
-| `PWM=50` | `!PWM=50\r\n` | Set manual PWM (-100~100, manual only) |
-| `STEP=5` | `!STEP=5\r\n` | Set key step (1/5/10) |
-
-#### PID Tuning
-
-| Command | Example | Description |
-|---|---|---|
-| `TRAN=3.0,0.3,1.0` | `!TRAN=3.0,0.3,1.0\r\n` | Set Kp, Ki, Kd |
-| `TRAN=3.0,0.3,1.0,3` | +interval | Also set interval |
-| `TRAN=3.0,0.3,1.0,3,10` | +sep_threshold | Set all 5 params |
-| `FINE=1.5,0.1,2.0` | `!FINE=1.5,0.1,2.0\r\n` | Set Kp, Ki, Kd |
-| `FINE=1.5,0.1,2.0,8` | +interval | Also set interval |
-| `FINE=1.5,0.1,2.0,8,5` | +range | Also set range |
-| `FINE=1.5,0.1,2.0,8,5,1.0,3.0` | All 7 params | Set all (last 2 = entry_min, entry_max) |
-| `FINEEN=1` | `!FINEEN=1\r\n` | Enable fine tuning condition; `0` keeps auto control in TRAN |
-| `DEADBAND=0.3` | `!DEADBAND=0.3\r\n` | Set deadband width (°C) |
-
-#### Network (reboot required after change)
-
-| Command | Example |
-|---|---|
-| `NET=192.168.1.100,192.168.1.1,255.255.255.0,8000` | Set IP, GW, Netmask, Port |
-| `MAC=02:00:00:00:00:01` | Set MAC address |
-
-#### Query
-
-| Command | Reply Example |
-|---|---|
-| `GET=STATE` | `STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575` |
-| `GET=TRAN` | `TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3,ST:10.0` |
-| `GET=FINE` | `FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0,EMN:1.0,EMX:3.0` |
-| `GET=FINEEN` | `FINEEN=1` |
-| `GET=DEADBAND` | `DEADBAND=0.30` |
-| `GET=NET` | `NET=IP:192.168.1.100,GW:192.168.1.1,NM:255.255.255.0,PORT:8000` |
-| `GET=ETH` | `ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0` |
-| `GET=CONFIG` | All config parameters (multi-line) |
-
-#### Persistence
-
-| Command | Description |
-|---|---|
-| `SAVE` | Save current config to Flash immediately |
-| `RESET` | Restore factory defaults (preserves MAC) |
-
-> Parameters auto-save to Flash after 500ms delay on change. `!SAVE` forces immediate save.
-
----
-
-## 5. Response Fields
-
-### STATE (`GET=STATE`)
-
-```
-STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575
+```text
+!ACK=OK
+!ACK=ERR
+!STATE=MODE:AUTO,PWM:35,GOAL:580,FB:575
 ```
 
-| Field | Meaning | Description |
-|---|---|---|
-| MODE | Mode | AUTO=自动, MAN=手动 |
-| PWM | Current PWM | -100~100, positive=heat, negative=fan |
-| GOAL | Target ×10 | e.g. 580 = 58.0°C |
-| FB | Feedback ×10 | e.g. 575 = 57.5°C |
+协议支持可选 XOR 校验，格式为 `!BODY*XX`。实际使用中，上位机会通过封装后的串口、网口和外部 API 能力完成命令发送与状态同步。
 
-### TRAN (`GET=TRAN`) — 变温工况
-
-```
-TRAN=KP:3.00,KI:0.300,KD:1.00,INT:3
-```
-
-| Field | Meaning | Description |
-|---|---|---|
-| KP | tran_kp | Proportional gain |
-| KI | tran_ki | Integral gain |
-| KD | tran_kd | Derivative gain |
-| INT | tran_interval | Adjust interval (seconds) |
-
-### FINE (`GET=FINE`) — 微调工况
-
-```
-FINE=KP:1.50,KI:0.100,KD:2.00,INT:8,RNG:5.0
-```
-
-| Field | Meaning | Description |
-|---|---|---|
-| KP | fine_kp | Proportional gain (conservative) |
-| KI | fine_ki | Integral gain |
-| KD | fine_kd | Derivative gain (strong damping) |
-| INT | fine_interval | Adjust interval (seconds, slower) |
-| RNG | fine_range | Max output change per step (%, tighter) |
-
-### ETH Diagnostics (`GET=ETH`)
-
-```
-ETH=LINK:1,PHY:0,ERR:0,PHYID:0007C0F1,RX:5,TX:5,ARP:2,ICMP:3,ANEG:1,TCP:0
-```
-
-| Field | Meaning |
-|---|---|
-| LINK | 1=cable connected, 0=disconnected |
-| PHY | PHY chip address (0 or 1, 255=not found) |
-| ERR | Error code (0=OK) |
-| PHYID | Chip ID (0007C0F1=LAN8720A, 00000000=not detected) |
-| RX | Received packets |
-| TX | Transmitted packets |
-| ARP | ARP replies |
-| ICMP | Ping replies |
-| ANEG | 1=auto-negotiation complete, 0=not complete |
-| TCP | 1=client connected, 0=no client |
-
-### Ethernet Error Codes
-
-| Code | Name | Meaning | Fix |
-|---|---|---|---|
-| 0 | `ETH_ERR_OK` | Link OK | -- |
-| 1 | `ETH_ERR_NO_PHY` | PHY chip not found | Check PHY soldering/power/crystal |
-| 2 | `ETH_ERR_NO_LINK` | No cable link | Check cable, peer power |
-| 3 | `ETH_ERR_ANEG_TIMEOUT` | Auto-negotiation timeout | Check 50MHz RMII clock |
-| 4 | `ETH_ERR_NOT_INITED` | ETH not initialized | Check eth.c included in build |
-
----
-
-## 6. Quick Start
-
-### First Power-On
-
-```
-1. Default: manual mode, target 30°C
-2. Connect UART (115200 8N1) or TCP (nc 192.168.1.100 8000)
-3. Send: MODE=AUTO
-4. Send: TEMP=58.0
-5. Observe: PID adjusts every pid_interval seconds (default 5s)
-```
-
-### Tuning Guide
-
-```
-1. TRAN (变温工况 — 位置式 PID):
-   Temperature rises too slowly -> Increase tran_kp (3→5)
-   Temperature overshoots       -> Increase tran_kd (1→3)
-   Steady-state error persists  -> Increase tran_ki (0.3→0.6)
-   Integral windup / PWM saturates -> Increase tran_interval (3→8) or decrease tran_ki
-
-2. FINE (微调工况 — 增量式 PID):
-   Small oscillations near target -> Decrease fine_kp (1.5→0.8), increase fine_kd (2→4)
-   Convergence too slow           -> Increase fine_ki (0.1→0.3)
-   PWM jumps too often            -> Increase fine_interval (8→15) or decrease fine_range (5→3)
-
-3. DEADBAND (共享死区):
-   Small oscillations near target -> Increase (0.3→0.5)
-   Temperature stays off by ~0.5°C -> Decrease (0.3→0.1)
-
-4. Save:
-   SAVE
-```
-
----
-
-## 7. Build (STM32)
-
-### Keil MDK
-
-- Project: `USER/DS18B20.uvprojx`
-- MCU: STM32F407VETx
-- StdPeriph Library: V1.4.0
-- Compiler: ARMCC V5.06
-
-### File Structure
-
-```
-USER/
-  main.c              Main program
-  app_config.h/.c     Unified config system
-  flash_params.h/.c   Flash persistence
-  pid_control.h/.c    PID controller
-
-HARDWARE/
-  ETH/eth.h/.c        Ethernet driver
-  LED/                LED driver
-  DS18B20/            Temperature sensor
-  KEY/                Keys
-  BEEP/               Buzzer
-  TIMER/              Timer
-  ADC/                ADC
-  HMI/                HMI display
-  PWM/                PWM output
-  DataScope_DP/       Data oscilloscope
-
-SYSTEM/
-  delay/              Delay
-  sys/                System
-  usart/              UART
-
-FWLIB/                STM32F4 StdPeriph Library
-```
-
----
-
-## 8. Troubleshooting
-
-| Symptom | Likely Cause | Fix |
-|---|---|---|
-| Temp stuck below target | TRAN Ki too weak | Increase tran_ki (0.3→0.6) |
-| Large overshoot on heat-up | TRAN Kp too high / Kd too low | Decrease tran_kp (5→3), increase tran_kd (1→3) |
-| PWM oscillates or saturates | TRAN Ki windup / interval too short | Increase tran_interval (3→8), decrease tran_ki |
-| Oscillation near target | FINE Kp too high / Kd too low | Decrease fine_kp (1.5→0.8), increase fine_kd (2→4) |
-| Slow convergence near target | FINE Ki too weak / interval too long | Increase fine_ki (0.1→0.3), decrease fine_interval (15→8) |
-| Steady oscillation ±0.3°C | Deadband too small | Increase pid_deadband (0.3→0.5) |
-| Network not connecting | IP mismatch / hardware | Use UART `GET=ETH` for diagnostics |
-| Flash save fails | Sector erase error | Check FLASH_Sector_7 not occupied |
-
----
-
-## 主要页面说明
-
-### 1. 首页
-
-首页主要用于实验过程监控与连接控制。
-
-包含以下功能：
-
-- 实时温度曲线显示
-- 目标温度直接输入修改
-- 串口连接状态查看
-- 网口区域状态展示与界面预留
-- 手动开始、暂停、恢复、结束录制
-- 录制会话号与 CSV 存储状态显示
-- 系统事件与操作日志显示
-
-说明：
-
-- 曲线横轴会随着采样推进持续更新
-- 曲线支持拖动回看历史数据
-- 可通过"回到最新"按钮恢复实时视图
-
-### 2. PID 整定页
-
-PID 整定页主要用于参数调节与对象参数设置。
-
-包含以下功能：
-
-- Kp、Ki、Kd 参数输入与滑块联动
-- PID 参数下发
-- 当前参数、已生效参数、历史参数对照
-- 共享被控对象参数设置
-- 参考公式显示
-- 运行指标查看，如超调、稳定时间、控制输出、扰动量等
-
-### 3. 系统配置页
-
-系统配置页主要用于录制策略与路径配置。
-
-包含以下功能：
-
-- 启用或关闭 CSV 录制
-- 设置是否自动开始录制
-- 设置全部断连时是否自动暂停
-- 配置 CSV 保存目录
-- 配置横轴每格时间与显示格数
-
-## 基本使用步骤
-
-建议按照以下流程进行实验：
-
-1. 启动程序，确认已获取管理员权限
-2. 进入首页，检查右侧录制策略和连接区状态
-3. 当前优先选择 COM 串口连接方式，网口功能暂不作为实验主流程
-4. 扫描并连接串口设备，确认主通道已经建立
-5. 在首页直接设置目标温度，观察曲线变化
-6. 如需记录实验数据，在首页启动录制
-7. 如需整定参数，进入 PID 整定页修改 Kp、Ki、Kd 并下发
-8. 实验结束后停止录制，导出 CSV 文件进行分析
-
-## CSV 记录说明
-
-程序当前以串口链路的数据记录为主，网口记录能力待后续联调完成后接入。
-
-记录规则如下：
-
-- 采样周期为 1 秒
-- 每 5 秒进行一次批量追加写入
-- 每次新开始录制都会生成新的 CSV 会话文件
-- 当前每次录制会生成串口侧 CSV 文件
-
-CSV 文件中包含以下典型字段：
-
-- sampleIndex
-- elapsedSeconds
-- channel
-- temperature
-- setpoint
-- requestedSetpoint
-- controlOutput
-- disturbance
-- overshootPercent
-- kp / ki / kd
-
-## 当前功能特点
-
-- 支持真实串口通信链路
-- 网口通信界面与配置入口已预留，协议对接待实现
-- 支持主通道概念与连接提醒
-- 支持二阶振荡对象仿真
-- 支持增量式 PID 控制计算
-- 支持目标温度实时修改
-- 支持图表历史拖动查看
-- 支持 CSV 记录与目录自定义
-- 支持 PID 参数调节与历史对照
-
-## 目录结构概览
+## 目录结构
 
 ```text
 src/
-  main/                 Electron 主进程
+  main/                 Electron 主进程，负责串口、文件、外部接口等能力
   preload/              Electron 预加载桥接
   renderer/             Vue 渲染进程
     src/
-      views/            页面
-      components/       公共组件
+      views/            页面：监控主页、参数整定、系统配置
+      components/       通用组件
+      router/           前端路由
       store/            Pinia 状态管理
-      services/         仿真与业务服务
+      services/         仿真和业务服务
+
+docs/
+  external-api.md       外部接口总览
+  integration-quickstart.md 快速接入指南
+  openapi.yaml          HTTP/OpenAPI 规范
+  mcp-tools.json        MCP 工具定义
+
+resources/              应用图标等资源
+build/                  构建资源
+dist/                   前端构建输出
+out/                    Electron 构建输出
 ```
 
-## 推荐开发工具
+## 开发工具
+
+推荐使用：
 
 - VS Code
 - Volar
 - ESLint
 - Prettier
-
-## 备注
-
-本项目当前以实验教学与仿真联调为主要目标，现阶段已完成真实串口链路接入；后续仍可继续扩展真实网口协议对接、图表缩放、实验报告导出等能力。

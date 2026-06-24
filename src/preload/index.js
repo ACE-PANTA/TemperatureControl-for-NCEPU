@@ -43,6 +43,7 @@ const deviceApi = {
   openPathInShell: (targetPath) => ipcRenderer.invoke('device:open-path-in-shell', targetPath),
   updateExternalSnapshot: (snapshot) => ipcRenderer.invoke('external:update-snapshot', snapshot),
   getExternalServiceStatus: () => ipcRenderer.invoke('external:get-service-status'),
+  configureExternalAccess: (config) => ipcRenderer.invoke('external:configure-access', config),
   onExternalServiceStatus: (callback) => {
     const listener = (_, payload) => callback(payload)
     ipcRenderer.on('external:service-status', listener)

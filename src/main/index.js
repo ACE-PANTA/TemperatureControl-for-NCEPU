@@ -29,10 +29,14 @@ let externalHttpServer = null
 let externalWsServer = null
 let externalWsHttpServer = null
 const externalWsClients = new Set()
+const externalAccessConfig = {
+  allowRemoteControl: false
+}
 const externalServiceStatus = {
-  http: { port: 8056, running: false, error: '' },
-  websocket: { port: 8057, running: false, error: '', clients: 0 },
-  mcp: { port: 8056, path: '/mcp', running: false, error: '' },
+  http: { port: 8056, host: '127.0.0.1', running: false, error: '' },
+  websocket: { port: 8057, host: '127.0.0.1', running: false, error: '', clients: 0 },
+  mcp: { port: 8056, host: '127.0.0.1', path: '/mcp', running: false, error: '' },
+  access: { allowRemoteControl: false, bindHost: '127.0.0.1' },
   renderer: { ready: false, lastSnapshotAt: null }
 }
 
@@ -796,6 +800,21 @@ function updateExternalServiceStatus(partial = {}) {
   })
 }
 
+function getExternalBindHost() {
+  return externalAccessConfig.allowRemoteControl ? '0.0.0.0' : '127.0.0.1'
+}
+
+function refreshExternalAccessStatus() {
+  const bindHost = getExternalBindHost()
+  externalServiceStatus.http.host = bindHost
+  externalServiceStatus.websocket.host = bindHost
+  externalServiceStatus.mcp.host = bindHost
+  externalServiceStatus.access = {
+    allowRemoteControl: externalAccessConfig.allowRemoteControl,
+    bindHost
+  }
+}
+
 function broadcastExternalWs(message) {
   const raw = JSON.stringify(message)
   for (const client of externalWsClients) {
@@ -1157,7 +1176,7 @@ async function handleMcpRequest(message) {
         result: {
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'temperature-control', version: '1.0.0' }
+          serverInfo: { name: 'temperature-control', version: '1.0.2' }
         }
       }
     }
@@ -1226,6 +1245,9 @@ function startExternalHttpServer() {
     return
   }
 
+  refreshExternalAccessStatus()
+  const bindHost = getExternalBindHost()
+
   externalHttpServer = http.createServer((request, response) => {
     handleExternalApiRequest(request, response).catch((error) => {
       setJsonResponse(response, 500, { ok: false, error: error.message || 'HTTP service failed' })
@@ -1240,11 +1262,13 @@ function startExternalHttpServer() {
     updateExternalServiceStatus()
   })
 
-  externalHttpServer.listen(8056, '127.0.0.1', () => {
+  externalHttpServer.listen(8056, bindHost, () => {
     externalServiceStatus.http.running = true
     externalServiceStatus.http.error = ''
+    externalServiceStatus.http.host = bindHost
     externalServiceStatus.mcp.running = true
     externalServiceStatus.mcp.error = ''
+    externalServiceStatus.mcp.host = bindHost
     updateExternalServiceStatus()
   })
 }
@@ -1253,6 +1277,9 @@ function startExternalWebSocketServer() {
   if (externalWsHttpServer) {
     return
   }
+
+  refreshExternalAccessStatus()
+  const bindHost = getExternalBindHost()
 
   externalWsHttpServer = http.createServer()
   externalWsServer = new WebSocketServer({ server: externalWsHttpServer })
@@ -1290,9 +1317,10 @@ function startExternalWebSocketServer() {
     updateExternalServiceStatus()
   })
 
-  externalWsHttpServer.listen(8057, '127.0.0.1', () => {
+  externalWsHttpServer.listen(8057, bindHost, () => {
     externalServiceStatus.websocket.running = true
     externalServiceStatus.websocket.error = ''
+    externalServiceStatus.websocket.host = bindHost
     updateExternalServiceStatus()
   })
 }
@@ -1302,17 +1330,62 @@ function startExternalServices() {
   startExternalWebSocketServer()
 }
 
-function stopExternalServices() {
+function closeExternalServer(server) {
+  return new Promise((resolve) => {
+    if (!server) {
+      resolve()
+      return
+    }
+
+    try {
+      server.close(() => resolve())
+    } catch {
+      resolve()
+    }
+  })
+}
+
+async function stopExternalServices() {
   for (const client of externalWsClients) {
     client.close()
   }
   externalWsClients.clear()
-  externalWsServer?.close()
-  externalWsHttpServer?.close()
-  externalHttpServer?.close()
+  const wsServer = externalWsServer
+  const wsHttpServer = externalWsHttpServer
+  const httpServer = externalHttpServer
   externalWsServer = null
   externalWsHttpServer = null
   externalHttpServer = null
+  await Promise.all([
+    closeExternalServer(wsServer),
+    closeExternalServer(wsHttpServer),
+    closeExternalServer(httpServer)
+  ])
+  externalServiceStatus.http.running = false
+  externalServiceStatus.http.error = ''
+  externalServiceStatus.websocket.running = false
+  externalServiceStatus.websocket.error = ''
+  externalServiceStatus.websocket.clients = 0
+  externalServiceStatus.mcp.running = false
+  externalServiceStatus.mcp.error = ''
+  refreshExternalAccessStatus()
+  updateExternalServiceStatus()
+}
+
+async function applyExternalAccessConfig(config = {}) {
+  const previousBindHost = getExternalBindHost()
+  externalAccessConfig.allowRemoteControl = config.allowRemoteControl === true
+  refreshExternalAccessStatus()
+  const nextBindHost = getExternalBindHost()
+
+  if (previousBindHost !== nextBindHost) {
+    await stopExternalServices()
+    startExternalServices()
+  } else {
+    updateExternalServiceStatus()
+  }
+
+  return externalServiceStatus.access
 }
 
 function decodeDataScopeFrame(frame) {
@@ -1943,6 +2016,10 @@ ipcMain.handle('external:update-snapshot', async (_, snapshot) => {
 })
 
 ipcMain.handle('external:get-service-status', async () => externalServiceStatus)
+
+ipcMain.handle('external:configure-access', async (_, config) => {
+  return applyExternalAccessConfig(config)
+})
 
 ipcMain.on('external:control-response', (_, message) => {
   const waiter = externalControlWaiters.get(message?.id)

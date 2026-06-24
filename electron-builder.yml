@@ -1,4 +1,4 @@
-appId: com.electron.app
+appId: com.cynlux.temperaturecontrol
 productName: 温控系统
 directories:
   buildResources: build

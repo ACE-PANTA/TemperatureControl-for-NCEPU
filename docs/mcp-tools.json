@@ -1,7 +1,7 @@
 {
   "server": {
     "name": "temperature-control",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "endpoint": "http://[your-host-ip]:8056/mcp",
     "transport": "json-rpc-over-http",
     "protocolVersion": "2026-06-14"

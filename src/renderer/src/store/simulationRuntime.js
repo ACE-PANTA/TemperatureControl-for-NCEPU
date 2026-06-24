@@ -267,6 +267,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     http: { port: 8056, running: false, error: '' },
     websocket: { port: 8057, running: false, error: '', clients: 0 },
     mcp: { port: 8056, path: '/mcp', running: false, error: '' },
+    access: { allowRemoteControl: false, bindHost: '127.0.0.1' },
     renderer: { ready: false, lastSnapshotAt: null }
   });
   const batchBuffers = reactive({
@@ -1370,6 +1371,7 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     Object.assign(externalServiceStatus.http, status.http || {});
     Object.assign(externalServiceStatus.websocket, status.websocket || {});
     Object.assign(externalServiceStatus.mcp, status.mcp || {});
+    Object.assign(externalServiceStatus.access, status.access || {});
     Object.assign(externalServiceStatus.renderer, status.renderer || {});
   }
 

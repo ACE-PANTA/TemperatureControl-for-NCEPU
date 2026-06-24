@@ -18,6 +18,7 @@ const defaultSystemSettings = {
   logDirectory: '',
   autoRecordingEnabled: true,
   autoPauseOnDisconnect: true,
+  allowRemoteControl: false,
   xAxisSecondsPerDivision: 5,
   xAxisDivisionCount: 6,
   yAxisDisplaySeriesKey: 'furnaceTemp',
@@ -206,11 +207,30 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
     return settings.logDirectory;
   }
 
+  async function syncExternalAccessConfig() {
+    if (!deviceApi?.configureExternalAccess) {
+      return null;
+    }
+
+    return deviceApi.configureExternalAccess({
+      allowRemoteControl: settings.allowRemoteControl === true
+    });
+  }
+
   loadPersistedState();
+
+  syncExternalAccessConfig().catch(() => {});
 
   watch(
     () => JSON.stringify({ settings, tranDraft, fineDraft, smithDraft, deadband: deadband.value, fineEnabled: fineEnabled.value, netDraft, plantDraft, paramRecords: paramRecords.value }),
     () => persistState()
+  );
+
+  watch(
+    () => settings.allowRemoteControl,
+    () => {
+      syncExternalAccessConfig().catch(() => {});
+    }
   );
 
   return {
@@ -227,6 +247,7 @@ export const useSystemConfigStore = defineStore('systemConfig', () => {
     removeParamRecord,
     loadPersistedState,
     ensureDefaultLogDirectory,
-    chooseLogDirectory
+    chooseLogDirectory,
+    syncExternalAccessConfig
   };
 });

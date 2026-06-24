@@ -1,6 +1,6 @@
 {
   "name": "tempecontrol",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "温控炉上位机系统",
   "main": "./out/main/index.js",
   "productName": "温控系统",

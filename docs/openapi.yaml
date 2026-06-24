@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Temperature Control External API
-  version: 1.0.0
+  version: 1.0.2
   description: |
     Local HTTP API for the Temperature Control desktop application.
     The service listens on 127.0.0.1:8056 and forwards commands to the existing serial or ethernet control channel.

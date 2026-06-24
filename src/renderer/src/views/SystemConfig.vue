@@ -43,6 +43,13 @@ onMounted(async () => {
           <span>全部断连时自动暂停</span>
           <input v-model="settings.autoPauseOnDisconnect" type="checkbox" />
         </label>
+        <label class="switch-card wide-card">
+          <span>允许外部计算机控制</span>
+          <input v-model="settings.allowRemoteControl" type="checkbox" />
+          <small>
+            {{ settings.allowRemoteControl ? '已开放局域网访问，HTTP 8056 / WebSocket 8057 监听 0.0.0.0' : '仅本机可访问，服务监听 127.0.0.1' }}
+          </small>
+        </label>
         <label>
           <span>横轴每格秒数</span>
           <input v-model.number="settings.xAxisSecondsPerDivision" type="number" min="1" max="60" step="1" />
@@ -192,6 +199,15 @@ onMounted(async () => {
   width: auto;
   justify-self: start;
   padding: 0;
+}
+
+.wide-card {
+  grid-column: 1 / -1;
+}
+
+.wide-card small {
+  color: var(--tc-text-dim);
+  line-height: 1.5;
 }
 
 .path-card {

@@ -11,12 +11,13 @@
     "summary": "Use these MCP tools to query and control the local temperature-control desktop application.",
     "preflight": [
       "Call temperature_get_status or temperature_refresh_snapshot before changing controller state.",
+      "Connection and primary-channel write tools are sensitive operations. Ask the user for explicit confirmation before calling them, then pass confirmed=true.",
       "Check snapshot.connection.primaryChannel and connection.*.connected before sending commands.",
       "If channel is omitted, the system uses the current primary channel.",
       "Use channel=serial for serial port control and channel=ethernet for ethernet control.",
       "For manual PWM output, switch to MAN mode before setting PWM.",
       "For target temperature control, switch to AUTO mode before setting temperature.",
-      "Use temperature_set_tran_pid for TRAN condition PID and temperature_set_fine_pid for FINE condition PID."
+      "Use temperature_set_tran_pid for TRAN condition PID, temperature_set_fine_pid for FINE condition PID, and temperature_set_smith for Smith predictor parameters."
     ],
     "common_errors": [
       "Device channel is not connected.",
@@ -47,7 +48,7 @@
     },
     {
       "name": "temperature_refresh_snapshot",
-      "description": "Query the controller through the selected channel and refresh mode, condition, TRAN PID, FINE PID, FINE enable flag and deadband.",
+      "description": "Query the controller through the selected channel and refresh mode, condition, TRAN PID, FINE PID, Smith predictor parameters, FINE enable flag and deadband.",
       "when_to_use": "Use this when the user wants the newest device-side state instead of the cached snapshot.",
       "inputSchema": {
         "type": "object",
@@ -59,6 +60,141 @@
         "additionalProperties": false
       },
       "example_arguments": {
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_get_connection_status",
+      "description": "Get serial, ethernet and primary-channel connection status. This read-only tool does not require confirmation.",
+      "when_to_use": "Use before connecting, disconnecting, or changing the primary channel.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "temperature_connect_serial",
+      "description": "Sensitive operation: connect the serial port. Ask the user for explicit confirmation before calling and pass confirmed=true.",
+      "when_to_use": "Use only after the user confirms connecting a serial port.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["confirmed"],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be true after explicit user confirmation."
+          },
+          "path": {
+            "type": "string",
+            "description": "Serial port path. If omitted, the app uses the selected or first discovered port."
+          },
+          "baudRate": {
+            "type": "number"
+          },
+          "dataBits": {
+            "type": "number"
+          },
+          "stopBits": {
+            "type": "number"
+          },
+          "parity": {
+            "type": "string",
+            "enum": ["none", "even", "odd", "mark", "space"]
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "confirmed": true,
+        "path": "COM3",
+        "baudRate": 115200
+      }
+    },
+    {
+      "name": "temperature_disconnect_serial",
+      "description": "Sensitive operation: disconnect the serial port. Ask the user for explicit confirmation before calling and pass confirmed=true.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["confirmed"],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be true after explicit user confirmation."
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "confirmed": true
+      }
+    },
+    {
+      "name": "temperature_connect_ethernet",
+      "description": "Sensitive operation: connect the ethernet device. Ask the user for explicit confirmation before calling and pass confirmed=true.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["confirmed", "host"],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be true after explicit user confirmation."
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "number"
+          },
+          "timeoutMs": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "confirmed": true,
+        "host": "192.168.1.100",
+        "port": 8000
+      }
+    },
+    {
+      "name": "temperature_disconnect_ethernet",
+      "description": "Sensitive operation: disconnect the ethernet device. Ask the user for explicit confirmation before calling and pass confirmed=true.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["confirmed"],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be true after explicit user confirmation."
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "confirmed": true
+      }
+    },
+    {
+      "name": "temperature_set_primary_channel",
+      "description": "Sensitive operation: set the primary data/control channel. Ask the user for explicit confirmation before calling and pass confirmed=true.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["confirmed", "channel"],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be true after explicit user confirmation."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "confirmed": true,
         "channel": "serial"
       }
     },
@@ -259,6 +395,56 @@
       },
       "example_arguments": {
         "deadband": 0.3,
+        "channel": "serial"
+      }
+    },
+    {
+      "name": "temperature_set_smith",
+      "description": "Set Smith predictor parameters.",
+      "when_to_use": "Use when the user wants to enable, disable or tune dead-time compensation / Smith predictor behavior.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["enabled", "gain", "tau", "delay", "blend", "maxLead"],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether Smith predictor control is enabled."
+          },
+          "gain": {
+            "type": "number",
+            "description": "Plant model gain."
+          },
+          "tau": {
+            "type": "number",
+            "description": "Plant model time constant in seconds."
+          },
+          "delay": {
+            "type": "number",
+            "description": "Pure delay in seconds."
+          },
+          "blend": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Blend ratio between measured and predicted feedback."
+          },
+          "maxLead": {
+            "type": "number",
+            "description": "Maximum allowed predicted lead in degrees Celsius."
+          },
+          "channel": {
+            "$ref": "#/$defs/channel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example_arguments": {
+        "enabled": true,
+        "gain": 40,
+        "tau": 120,
+        "delay": 30,
+        "blend": 0.7,
+        "maxLead": 8,
         "channel": "serial"
       }
     },

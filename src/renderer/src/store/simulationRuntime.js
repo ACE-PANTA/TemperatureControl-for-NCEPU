@@ -300,8 +300,13 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   const netDraft = computed(() => configStore.netDraft);
   const plantDraft = computed(() => configStore.plantDraft);
   const logDirectory = computed(() => configStore.settings.logDirectory);
+  const visibleDurationSeconds = computed(() => {
+    const secondsPerDivision = Math.max(1, Number(configStore.settings.xAxisSecondsPerDivision) || 1);
+    const divisionCount = Math.max(1, Number(configStore.settings.xAxisDivisionCount) || 1);
+    return secondsPerDivision * divisionCount;
+  });
   const visiblePointCount = computed(() => {
-    return Math.max(12, Number(configStore.settings.xAxisSecondsPerDivision) * Number(configStore.settings.xAxisDivisionCount));
+    return Math.max(2, Math.round(visibleDurationSeconds.value) + 1);
   });
   const visibleCurveSamples = computed(() => {
     const history = curveHistory.value;
@@ -309,28 +314,45 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return [];
     }
 
-    const windowSize = visiblePointCount.value;
-    const maxOffset = Math.max(0, history.length - windowSize);
+    const lastElapsed = Number(history.at(-1)?.elapsedSeconds) || 0;
+    const maxOffset = Math.max(0, lastElapsed - visibleDurationSeconds.value);
     const boundedOffset = Math.min(Math.max(chartPanOffset.value, 0), maxOffset);
-    const end = history.length - boundedOffset;
-    const start = Math.max(0, end - windowSize);
+    const startTime = Math.max(0, lastElapsed - boundedOffset - visibleDurationSeconds.value);
+    const endTime = startTime + visibleDurationSeconds.value;
 
-    return history.slice(start, end);
+    return history.filter((sample) => {
+      const elapsedSeconds = Number(sample.elapsedSeconds);
+      return Number.isFinite(elapsedSeconds) && elapsedSeconds >= startTime && elapsedSeconds <= endTime;
+    });
   });
   const curvePoints = computed(() => visibleCurveSamples.value.map((item) => item.temperature));
   const visibleTimeRange = computed(() => {
-    const points = visibleCurveSamples.value;
+    const history = curveHistory.value;
+    if (!history.length) {
+      return {
+        start: 0,
+        end: visibleDurationSeconds.value,
+        latest: 0
+      };
+    }
+
+    const latest = Number(history.at(-1)?.elapsedSeconds) || 0;
+    const maxOffset = Math.max(0, latest - visibleDurationSeconds.value);
+    const boundedOffset = Math.min(Math.max(chartPanOffset.value, 0), maxOffset);
+    const start = Math.max(0, latest - boundedOffset - visibleDurationSeconds.value);
+
     return {
-      start: points[0]?.elapsedSeconds ?? 0,
-      end: points.at(-1)?.elapsedSeconds ?? 0
+      start,
+      end: start + visibleDurationSeconds.value,
+      latest
     };
   });
   const xAxisLabels = computed(() => {
-    const divisionCount = Number(configStore.settings.xAxisDivisionCount);
-    const step = Number(configStore.settings.xAxisSecondsPerDivision);
+    const divisionCount = Math.max(1, Number(configStore.settings.xAxisDivisionCount) || 1);
+    const step = Math.max(1, Number(configStore.settings.xAxisSecondsPerDivision) || 1);
     const start = visibleTimeRange.value.start;
 
-    return Array.from({ length: divisionCount + 1 }, (_, index) => `${Math.max(0, start + index * step)}s`);
+    return Array.from({ length: divisionCount + 1 }, (_, index) => `${Math.round(Math.max(0, start + index * step))}s`);
   });
   const xAxisStepLabel = computed(() => {
     const range = visibleTimeRange.value;
@@ -414,7 +436,8 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
       return;
     }
 
-    const maxOffset = Math.max(0, history.length - visiblePointCount.value);
+    const lastElapsed = Number(history.at(-1)?.elapsedSeconds) || 0;
+    const maxOffset = Math.max(0, lastElapsed - visibleDurationSeconds.value);
     chartPanOffset.value = Math.min(chartPanOffset.value, maxOffset);
   }
 
@@ -427,7 +450,9 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
   }
 
   function panChartWindow(deltaPoints) {
-    const maxOffset = Math.max(0, curveHistory.value.length - visiblePointCount.value);
+    const history = curveHistory.value;
+    const lastElapsed = Number(history.at(-1)?.elapsedSeconds) || 0;
+    const maxOffset = Math.max(0, lastElapsed - visibleDurationSeconds.value);
     chartPanOffset.value = Math.min(maxOffset, Math.max(0, chartPanOffset.value + Number(deltaPoints || 0)));
   }
 
@@ -1258,6 +1283,14 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
     return result;
   }
 
+  function requireExternalConfirmation(payload, operation) {
+    if (payload?.confirmed === true) {
+      return;
+    }
+
+    throw new Error(`${operation} is a sensitive operation. Ask the user for explicit confirmation, then retry with confirmed=true.`);
+  }
+
   function buildExternalSnapshot() {
     return {
       version: 1,
@@ -1368,6 +1401,35 @@ export const useSimulationRuntimeStore = defineStore('simulationRuntime', () => 
 
   async function handleExternalControlAction(action, payload) {
     const channel = payload.channel || null;
+
+    if (action === 'get_connection_status') {
+      return { applied: false, connection: deviceStore.getConnectionControlSnapshot() };
+    }
+
+    if (action === 'connect_serial') {
+      requireExternalConfirmation(payload, 'Connecting the serial port');
+      return { applied: true, connection: await deviceStore.externalConnectSerial(payload) };
+    }
+
+    if (action === 'disconnect_serial') {
+      requireExternalConfirmation(payload, 'Disconnecting the serial port');
+      return { applied: true, connection: await deviceStore.externalDisconnectSerial() };
+    }
+
+    if (action === 'connect_ethernet') {
+      requireExternalConfirmation(payload, 'Connecting the ethernet device');
+      return { applied: true, connection: await deviceStore.externalConnectEthernet(payload) };
+    }
+
+    if (action === 'disconnect_ethernet') {
+      requireExternalConfirmation(payload, 'Disconnecting the ethernet device');
+      return { applied: true, connection: await deviceStore.externalDisconnectEthernet() };
+    }
+
+    if (action === 'set_primary_channel') {
+      requireExternalConfirmation(payload, 'Changing the primary channel');
+      return { applied: true, connection: deviceStore.externalSetPrimaryChannel(payload.channel) };
+    }
 
     if (action === 'refresh_snapshot') {
       await refreshControllerSnapshot({ silent: true, channel });

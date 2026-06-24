@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import PrimaryChannelPanel from '../components/PrimaryChannelPanel.vue';
 import { useDeviceRuntimeStore } from '../store/deviceRuntime.js';
@@ -57,6 +57,18 @@ const channelOptions = computed(() => {
   }
   return options;
 });
+
+function syncDispatchChannelToPrimary() {
+  const availableChannels = channelOptions.value.map((option) => option.value);
+  if (primaryChannel.value && availableChannels.includes(primaryChannel.value)) {
+    dispatchChannel.value = primaryChannel.value;
+    return;
+  }
+
+  if (!availableChannels.includes(dispatchChannel.value)) {
+    dispatchChannel.value = availableChannels[0] || 'serial';
+  }
+}
 
 const hasActiveChannel = computed(() => channelOptions.value.length > 0);
 const dispatchChannelLabel = computed(() => {
@@ -380,16 +392,18 @@ function setChannel(ch) {
   dispatchChannel.value = ch;
 }
 
+watch(
+  () => [primaryChannel.value, serialConnected.value, ethernetConnected.value],
+  () => syncDispatchChannelToPrimary(),
+  { immediate: true }
+);
+
 onMounted(async () => {
   configStore.loadPersistedState();
   await deviceStore.initializeCommunication();
   await simulationStore.ensureRunning();
   await simulationStore.refreshControllerSnapshot({ silent: true });
-  if (serialConnected.value) {
-    dispatchChannel.value = 'serial';
-  } else if (ethernetConnected.value) {
-    dispatchChannel.value = 'ethernet';
-  }
+  syncDispatchChannelToPrimary();
 });
 </script>
 

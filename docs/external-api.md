@@ -63,6 +63,7 @@ curl http://127.0.0.1:8056/health
 - `controller.feedbackTemperature`: 反馈温度。
 - `pid.tran`: 变温工况 PID 参数。
 - `pid.fine`: 微调工况 PID 参数。
+- `pid.smith`: Smith 预估控制参数。
 - `pid.deadband`: 共享死区。
 - `pid.fineEnabled`: 是否允许进入微调工况。
 - `sample.primary`: 当前主通道实时采样。
@@ -81,8 +82,15 @@ HTTP API 适合被普通软件、脚本、上位系统调用。请求和响应�
 | `POST` | `/api/mode` | 切换自动/手动模式 |
 | `POST` | `/api/manual-pwm` | 下发手动 PWM |
 | `POST` | `/api/target-temperature` | 下发自动模式目标温度 |
+| `POST` | `/api/connection/status` | 读取串口、网口和主通道连接状态 |
+| `POST` | `/api/connection/serial/connect` | 连接串口，敏感操作，需 `confirmed: true` |
+| `POST` | `/api/connection/serial/disconnect` | 断开串口，敏感操作，需 `confirmed: true` |
+| `POST` | `/api/connection/ethernet/connect` | 连接网口，敏感操作，需 `confirmed: true` |
+| `POST` | `/api/connection/ethernet/disconnect` | 断开网口，敏感操作，需 `confirmed: true` |
+| `POST` | `/api/connection/primary-channel` | 设置主通道，敏感操作，需 `confirmed: true` |
 | `POST` | `/api/pid/tran` | 下发变温工况 PID |
 | `POST` | `/api/pid/fine` | 下发微调工况 PID |
+| `POST` | `/api/pid/smith` | 下发 Smith 预估控制参数 |
 | `POST` | `/api/pid/deadband` | 下发共享死区 |
 | `POST` | `/api/pid/fine-enable` | 启用或禁用微调工况 |
 | `POST` | `/api/save` | 保存当前设备配置 |
@@ -209,8 +217,15 @@ WebSocket 也支持发送控制命令：
 - `set_mode`
 - `set_manual_pwm`
 - `set_target_temperature`
+- `get_connection_status`
+- `connect_serial`
+- `disconnect_serial`
+- `connect_ethernet`
+- `disconnect_ethernet`
+- `set_primary_channel`
 - `set_tran_pid`
 - `set_fine_pid`
+- `set_smith`
 - `set_deadband`
 - `set_fine_enable`
 - `save_config`
@@ -299,6 +314,8 @@ MCP 失败响应格式：
 
 ## 安全边界
 
+- Smith 预估控制可通过 HTTP `/api/pid/smith`、WebSocket `set_smith` 和 MCP `temperature_set_smith` 读写；字段为 `enabled`、`gain`、`tau`、`delay`、`blend`、`maxLead`。
+- 串口连接、网口连接、断开连接和主通道切换属于敏感操作。MCP 模型必须先向用户明确确认，再调用 `temperature_connect_serial`、`temperature_disconnect_serial`、`temperature_connect_ethernet`、`temperature_disconnect_ethernet` 或 `temperature_set_primary_channel`，并传入 `confirmed: true`；未确认时接口会拒绝执行。
 - HTTP/MCP/WebSocket 均只监听 `127.0.0.1`，默认仅允许本机访问。
 - 外部命令不会绕过现有上位机状态管理，所有下发仍走原有串口/网口命令链路。
 - 修改 PID 或控制输出前，应先确认设备已连接、工况正确、目标通道正确。

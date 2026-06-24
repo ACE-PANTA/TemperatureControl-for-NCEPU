@@ -41,9 +41,9 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
 
   const ethernetConfig = reactive({
     host: '',
-    port: 502,
+    port: 8000,
     subnetPrefix: '',
-    scanPort: 502,
+    scanPort: 8000,
     timeoutMs: 220
   });
 
@@ -103,7 +103,6 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
         title: '双通道同时在线',
         message: `串口与网口已同时连接，实时曲线和 PID 参数下发当前以${primaryChannel.value === 'ethernet' ? '网口' : '串口'}主通道为准。`
       });
-      return alerts;
     }
 
     if (!serialConnected.value && !ethernetConnected.value) {
@@ -121,7 +120,7 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
   });
 
   watch(
-    () => [serialConnected.value, ethernetConnected.value, hasReachableCandidates.value, primaryChannel.value],
+    () => [serialConnected.value, ethernetConnected.value, hasReachableCandidates.value],
     () => {
       dismissedWarningIds.value = [];
     }
@@ -205,7 +204,7 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
       }
 
       activeSerialLabel.value = `${result.path} @ ${result.baudRate}`;
-      primaryPreference.value = primaryChannel.value || 'serial';
+      primaryPreference.value = 'serial';
       appendEvent(`串口已连接：${activeSerialLabel.value}`);
     } catch (error) {
       serialConnected.value = false;
@@ -291,7 +290,7 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
       }
 
       activeEthernetLabel.value = `${result.host}:${result.port}`;
-      primaryPreference.value = primaryChannel.value || 'ethernet';
+      primaryPreference.value = 'ethernet';
       appendEvent(`网口已连接：${activeEthernetLabel.value}，延迟 ${result.latencyMs} ms`);
     } catch (error) {
       ethernetConnected.value = false;
@@ -311,6 +310,77 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
     ethernetConnected.value = false;
     activeEthernetLabel.value = '未连接';
     appendEvent('网口连接已断开');
+  }
+
+  function getConnectionControlSnapshot() {
+    return JSON.parse(JSON.stringify({
+      primaryChannel: primaryChannel.value,
+      serial: {
+        connected: serialConnected.value,
+        label: activeSerialLabel.value,
+        selectedPath: selectedSerialPath.value,
+        config: { ...serialConfig },
+        discovered: discoveredSerial.value
+      },
+      ethernet: {
+        connected: ethernetConnected.value,
+        label: activeEthernetLabel.value,
+        host: ethernetConfig.host,
+        port: ethernetConfig.port,
+        discovered: discoveredEthernet.value
+      }
+    }));
+  }
+
+  async function externalConnectSerial(options = {}) {
+    if (options.path) selectedSerialPath.value = options.path;
+    if (options.baudRate !== undefined) serialConfig.baudRate = Number(options.baudRate);
+    if (options.dataBits !== undefined) serialConfig.dataBits = Number(options.dataBits);
+    if (options.stopBits !== undefined) serialConfig.stopBits = Number(options.stopBits);
+    if (options.parity) serialConfig.parity = options.parity;
+    if (!selectedSerialPath.value) await searchSerialPorts();
+
+    await connectSerialPort();
+    if (!serialConnected.value) throw new Error('Serial connection failed');
+    return getConnectionControlSnapshot();
+  }
+
+  async function externalDisconnectSerial() {
+    await disconnectSerialPort();
+    return getConnectionControlSnapshot();
+  }
+
+  async function externalConnectEthernet(options = {}) {
+    if (options.host) {
+      ethernetConfig.host = options.host;
+      selectedEthernetHost.value = options.host;
+    }
+    if (options.port !== undefined) ethernetConfig.port = Number(options.port);
+    if (options.timeoutMs !== undefined) ethernetConfig.timeoutMs = Number(options.timeoutMs);
+
+    await connectEthernetDevice();
+    if (!ethernetConnected.value) throw new Error('Ethernet connection failed');
+    return getConnectionControlSnapshot();
+  }
+
+  async function externalDisconnectEthernet() {
+    await disconnectEthernetDevice();
+    return getConnectionControlSnapshot();
+  }
+
+  function externalSetPrimaryChannel(channel) {
+    if (channel !== 'serial' && channel !== 'ethernet') {
+      throw new Error('Primary channel must be serial or ethernet');
+    }
+    if (channel === 'serial' && !serialConnected.value) {
+      throw new Error('Cannot set primary channel to serial because serial is not connected');
+    }
+    if (channel === 'ethernet' && !ethernetConnected.value) {
+      throw new Error('Cannot set primary channel to ethernet because ethernet is not connected');
+    }
+
+    setPrimaryChannel(channel);
+    return getConnectionControlSnapshot();
   }
 
   const tcpProtocolEnabled = ref(false);
@@ -386,6 +456,12 @@ export const useDeviceRuntimeStore = defineStore('deviceRuntime', () => {
     searchEthernetDevices,
     connectEthernetDevice,
     disconnectEthernetDevice,
+    getConnectionControlSnapshot,
+    externalConnectSerial,
+    externalDisconnectSerial,
+    externalConnectEthernet,
+    externalDisconnectEthernet,
+    externalSetPrimaryChannel,
     initializeCommunication
   };
 });

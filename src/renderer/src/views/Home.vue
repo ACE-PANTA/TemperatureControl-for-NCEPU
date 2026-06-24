@@ -106,6 +106,18 @@ const commandChannelOptions = computed(() => {
   return options;
 });
 
+function syncCommandChannelToPrimary() {
+  const availableChannels = commandChannelOptions.value.map((option) => option.value);
+  if (primaryChannel.value && availableChannels.includes(primaryChannel.value)) {
+    commandChannel.value = primaryChannel.value;
+    return;
+  }
+
+  if (!availableChannels.includes(commandChannel.value)) {
+    commandChannel.value = availableChannels[0] || 'serial';
+  }
+}
+
 const canResumeRecording = computed(() => recordingState.value.active && recordingState.value.paused);
 const canStartRecording = computed(() => !recordingState.value.active);
 const hasCurrentTemp = computed(() => Number.isFinite(currentTemp.value));
@@ -289,6 +301,12 @@ watch(
   { immediate: true }
 );
 
+watch(
+  () => [primaryChannel.value, serialConnected.value, ethernetConnected.value],
+  () => syncCommandChannelToPrimary(),
+  { immediate: true }
+);
+
 const axisSeriesOptions = computed(() => {
   const options = new Map();
 
@@ -379,6 +397,13 @@ function mapIndexToX(index, pointCount) {
   return CHART_PADDING + (index * (CHART_WIDTH - CHART_PADDING * 2)) / (pointCount - 1);
 }
 
+function mapElapsedToX(elapsedSeconds) {
+  const range = simulationStore.visibleTimeRange;
+  const duration = Math.max(1, Number(range.end) - Number(range.start));
+  const ratio = (Number(elapsedSeconds) - Number(range.start)) / duration;
+  return CHART_PADDING + Math.max(0, Math.min(1, ratio)) * (CHART_WIDTH - CHART_PADDING * 2);
+}
+
 function buildSeriesPath(seriesKey, points) {
   if (!points.length) {
     return '';
@@ -386,7 +411,8 @@ function buildSeriesPath(seriesKey, points) {
 
   return points
     .map((point, index) => {
-      const x = mapIndexToX(point.index, visiblePointCount.value);
+      const sample = visibleCurveSamples.value[point.index];
+      const x = sample ? mapElapsedToX(sample.elapsedSeconds) : mapIndexToX(point.index, visiblePointCount.value);
       const y = mapValueToY(point.value, seriesKey);
       return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
@@ -432,8 +458,10 @@ const areaPath = computed(() => {
     return '';
   }
 
-  const firstX = mapIndexToX(series.points[0].index, visiblePointCount.value);
-  const lastX = mapIndexToX(series.points.at(-1).index, visiblePointCount.value);
+  const firstSample = visibleCurveSamples.value[series.points[0].index];
+  const lastSample = visibleCurveSamples.value[series.points.at(-1).index];
+  const firstX = firstSample ? mapElapsedToX(firstSample.elapsedSeconds) : mapIndexToX(series.points[0].index, visiblePointCount.value);
+  const lastX = lastSample ? mapElapsedToX(lastSample.elapsedSeconds) : mapIndexToX(series.points.at(-1).index, visiblePointCount.value);
   const baseline = CHART_HEIGHT - CHART_PADDING;
   return `${series.path} L ${lastX.toFixed(2)} ${baseline.toFixed(2)} L ${firstX.toFixed(2)} ${baseline.toFixed(2)} Z`;
 });
@@ -455,7 +483,8 @@ const hoveredX = computed(() => {
     return null;
   }
 
-  return mapIndexToX(hoveredPointIndex.value, visiblePointCount.value);
+  const sample = visibleCurveSamples.value[hoveredPointIndex.value];
+  return sample ? mapElapsedToX(sample.elapsedSeconds) : mapIndexToX(hoveredPointIndex.value, visiblePointCount.value);
 });
 
 const hoveredMarkers = computed(() => {
@@ -660,18 +689,16 @@ function updateHoveredPoint(clientX) {
     return;
   }
 
-  const slotCount = Math.max(visiblePointCount.value - 1, 1);
-  const slotWidth = (plotEndX - plotStartX) / slotCount;
-  const nearestIndex = Math.round((normalizedX - plotStartX) / slotWidth);
+  const nearest = visibleCurveSamples.value
+    .map((sample, index) => ({
+      index,
+      x: mapElapsedToX(sample.elapsedSeconds)
+    }))
+    .sort((left, right) => Math.abs(left.x - normalizedX) - Math.abs(right.x - normalizedX))[0];
+  const tolerance = Math.max(8, (plotEndX - plotStartX) / Math.max(visiblePointCount.value - 1, 1) / 2);
 
-  if (nearestIndex < 0 || nearestIndex >= visibleCurveSamples.value.length) {
-    hoveredPointIndex.value = -1;
-    return;
-  }
-
-  const nearestX = mapIndexToX(nearestIndex, visiblePointCount.value);
-  hoveredPointIndex.value = Math.abs(normalizedX - nearestX) <= slotWidth / 2
-    ? nearestIndex
+  hoveredPointIndex.value = nearest && Math.abs(normalizedX - nearest.x) <= tolerance
+    ? nearest.index
     : -1;
 }
 
@@ -679,11 +706,7 @@ onMounted(async () => {
   await deviceStore.initializeCommunication();
   await simulationStore.ensureRunning();
   simulationStore.syncDraftToChannels();
-  if (serialConnected.value) {
-    commandChannel.value = 'serial';
-  } else if (ethernetConnected.value) {
-    commandChannel.value = 'ethernet';
-  }
+  syncCommandChannelToPrimary();
 });
 </script>
 

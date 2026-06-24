@@ -914,6 +914,12 @@ async function handleExternalApiRequest(request, response) {
       '/api/mode': 'set_mode',
       '/api/manual-pwm': 'set_manual_pwm',
       '/api/target-temperature': 'set_target_temperature',
+      '/api/connection/status': 'get_connection_status',
+      '/api/connection/serial/connect': 'connect_serial',
+      '/api/connection/serial/disconnect': 'disconnect_serial',
+      '/api/connection/ethernet/connect': 'connect_ethernet',
+      '/api/connection/ethernet/disconnect': 'disconnect_ethernet',
+      '/api/connection/primary-channel': 'set_primary_channel',
       '/api/pid/tran': 'set_tran_pid',
       '/api/pid/fine': 'set_fine_pid',
       '/api/pid/smith': 'set_smith',
@@ -946,6 +952,71 @@ const mcpTools = [
     inputSchema: {
       type: 'object',
       properties: { channel: { type: 'string', enum: ['serial', 'ethernet'] } }
+    }
+  },
+  {
+    name: 'temperature_get_connection_status',
+    description: 'Get serial, ethernet and primary-channel connection status. This read-only tool does not require confirmation.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'temperature_connect_serial',
+    description: 'Sensitive operation: connect the serial port. The model must ask the user for explicit confirmation before calling and must pass confirmed=true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        confirmed: { type: 'boolean' },
+        path: { type: 'string' },
+        baudRate: { type: 'number' },
+        dataBits: { type: 'number' },
+        stopBits: { type: 'number' },
+        parity: { type: 'string', enum: ['none', 'even', 'odd', 'mark', 'space'] }
+      },
+      required: ['confirmed']
+    }
+  },
+  {
+    name: 'temperature_disconnect_serial',
+    description: 'Sensitive operation: disconnect the serial port. The model must ask the user for explicit confirmation before calling and must pass confirmed=true.',
+    inputSchema: {
+      type: 'object',
+      properties: { confirmed: { type: 'boolean' } },
+      required: ['confirmed']
+    }
+  },
+  {
+    name: 'temperature_connect_ethernet',
+    description: 'Sensitive operation: connect the ethernet device. The model must ask the user for explicit confirmation before calling and must pass confirmed=true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        confirmed: { type: 'boolean' },
+        host: { type: 'string' },
+        port: { type: 'number' },
+        timeoutMs: { type: 'number' }
+      },
+      required: ['confirmed', 'host']
+    }
+  },
+  {
+    name: 'temperature_disconnect_ethernet',
+    description: 'Sensitive operation: disconnect the ethernet device. The model must ask the user for explicit confirmation before calling and must pass confirmed=true.',
+    inputSchema: {
+      type: 'object',
+      properties: { confirmed: { type: 'boolean' } },
+      required: ['confirmed']
+    }
+  },
+  {
+    name: 'temperature_set_primary_channel',
+    description: 'Sensitive operation: set the primary data/control channel to serial or ethernet. The model must ask the user for explicit confirmation before calling and must pass confirmed=true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        confirmed: { type: 'boolean' },
+        channel: { type: 'string', enum: ['serial', 'ethernet'] }
+      },
+      required: ['confirmed', 'channel']
     }
   },
   {
@@ -1101,6 +1172,12 @@ async function handleMcpRequest(message) {
       const toolActions = {
         temperature_get_status: null,
         temperature_refresh_snapshot: 'refresh_snapshot',
+        temperature_get_connection_status: 'get_connection_status',
+        temperature_connect_serial: 'connect_serial',
+        temperature_disconnect_serial: 'disconnect_serial',
+        temperature_connect_ethernet: 'connect_ethernet',
+        temperature_disconnect_ethernet: 'disconnect_ethernet',
+        temperature_set_primary_channel: 'set_primary_channel',
         temperature_set_mode: 'set_mode',
         temperature_set_manual_pwm: 'set_manual_pwm',
         temperature_set_target_temperature: 'set_target_temperature',

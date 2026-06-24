@@ -131,6 +131,125 @@ paths:
                 $ref: "#/components/schemas/ActionResponse"
         "500":
           $ref: "#/components/responses/Error"
+  /api/connection/status:
+    post:
+      tags: [Control]
+      summary: Get serial, ethernet and primary-channel connection status
+      operationId: getConnectionStatus
+      responses:
+        "200":
+          description: Connection status returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/connection/serial/connect:
+    post:
+      tags: [Control]
+      summary: Connect serial port
+      description: Sensitive operation. Requires explicit user confirmation and confirmed=true.
+      operationId: connectSerial
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectSerialRequest"
+      responses:
+        "200":
+          description: Serial port connected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/connection/serial/disconnect:
+    post:
+      tags: [Control]
+      summary: Disconnect serial port
+      description: Sensitive operation. Requires explicit user confirmation and confirmed=true.
+      operationId: disconnectSerial
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfirmedRequest"
+      responses:
+        "200":
+          description: Serial port disconnected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/connection/ethernet/connect:
+    post:
+      tags: [Control]
+      summary: Connect ethernet device
+      description: Sensitive operation. Requires explicit user confirmation and confirmed=true.
+      operationId: connectEthernet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectEthernetRequest"
+      responses:
+        "200":
+          description: Ethernet device connected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/connection/ethernet/disconnect:
+    post:
+      tags: [Control]
+      summary: Disconnect ethernet device
+      description: Sensitive operation. Requires explicit user confirmation and confirmed=true.
+      operationId: disconnectEthernet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfirmedRequest"
+      responses:
+        "200":
+          description: Ethernet device disconnected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/connection/primary-channel:
+    post:
+      tags: [Control]
+      summary: Set primary channel
+      description: Sensitive operation. Requires explicit user confirmation and confirmed=true.
+      operationId: setPrimaryChannel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetPrimaryChannelRequest"
+      responses:
+        "200":
+          description: Primary channel changed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
   /api/pid/tran:
     post:
       tags: [PID]
@@ -165,6 +284,26 @@ paths:
       responses:
         "200":
           description: FINE PID updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/pid/smith:
+    post:
+      tags: [PID]
+      summary: Set Smith predictor parameters
+      operationId: setSmithPid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetSmithRequest"
+      responses:
+        "200":
+          description: Smith predictor parameters updated
           content:
             application/json:
               schema:
@@ -298,6 +437,49 @@ components:
             temperature:
               type: number
               description: Target temperature in degrees Celsius.
+    ConfirmedRequest:
+      type: object
+      required: [confirmed]
+      properties:
+        confirmed:
+          type: boolean
+          description: Must be true after explicit user confirmation.
+    ConnectSerialRequest:
+      allOf:
+        - $ref: "#/components/schemas/ConfirmedRequest"
+        - type: object
+          properties:
+            path:
+              type: string
+            baudRate:
+              type: number
+            dataBits:
+              type: number
+            stopBits:
+              type: number
+            parity:
+              type: string
+              enum: [none, even, odd, mark, space]
+    ConnectEthernetRequest:
+      allOf:
+        - $ref: "#/components/schemas/ConfirmedRequest"
+        - type: object
+          required: [host]
+          properties:
+            host:
+              type: string
+            port:
+              type: number
+            timeoutMs:
+              type: number
+    SetPrimaryChannelRequest:
+      allOf:
+        - $ref: "#/components/schemas/ConfirmedRequest"
+        - type: object
+          required: [channel]
+          properties:
+            channel:
+              $ref: "#/components/schemas/Channel"
     SetTranPidRequest:
       allOf:
         - $ref: "#/components/schemas/ChannelRequest"
@@ -346,6 +528,32 @@ components:
             stableDelta:
               type: number
               description: Stability temperature delta in degrees Celsius.
+    SetSmithRequest:
+      allOf:
+        - $ref: "#/components/schemas/ChannelRequest"
+        - type: object
+          required: [enabled, gain, tau, delay, blend, maxLead]
+          properties:
+            enabled:
+              type: boolean
+              description: Whether Smith predictor control is enabled.
+            gain:
+              type: number
+              description: Plant model gain.
+            tau:
+              type: number
+              description: Plant model time constant in seconds.
+            delay:
+              type: number
+              description: Pure delay in seconds.
+            blend:
+              type: number
+              minimum: 0
+              maximum: 1
+              description: Blend ratio between measured and predicted feedback.
+            maxLead:
+              type: number
+              description: Maximum allowed predicted lead in degrees Celsius.
     SetDeadbandRequest:
       allOf:
         - $ref: "#/components/schemas/ChannelRequest"
@@ -510,6 +718,8 @@ components:
               $ref: "#/components/schemas/TranPid"
             fine:
               $ref: "#/components/schemas/FinePid"
+            smith:
+              $ref: "#/components/schemas/SmithPid"
             deadband:
               type: number
             fineEnabled:
@@ -570,6 +780,21 @@ components:
         stableWindow:
           type: number
         stableDelta:
+          type: number
+    SmithPid:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        gain:
+          type: number
+        tau:
+          type: number
+        delay:
+          type: number
+        blend:
+          type: number
+        maxLead:
           type: number
     McpJsonRpcRequest:
       type: object
